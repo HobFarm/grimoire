@@ -1,0 +1,35 @@
+# Environment & secrets
+.env
+.dev.vars
+.dev.vars.*
+
+# Build artifacts
+.wrangler/
+node_modules/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large data artifacts (bulk processing)
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+*.zip
+
+# Large SQL artifacts at root (bulk imports, dedup scripts)
+/*.sql
+
+# Transformed data
+transformed/
+
+# Notes (large reference docs)
+_notes/
+
+# Claude internals
+.claude/
+
+# HobBot is its own repo
+HobBot/

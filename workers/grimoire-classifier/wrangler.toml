@@ -1,0 +1,15 @@
+name = "grimoire-classifier"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+AI_GATEWAY_URL = "https://gateway.ai.cloudflare.com/v1/e343cbfa70c5166f00d871e513ae352a/hobfarm"
+
+[[d1_databases]]
+binding = "GRIMOIRE_DB"
+database_name = "grimoire-db"
+database_id = "3cb1cdee-17af-477c-ab0a-5a18447948ef"
+
+# Set GEMINI_API_KEY as a secret:
+# wrangler secret put GEMINI_API_KEY

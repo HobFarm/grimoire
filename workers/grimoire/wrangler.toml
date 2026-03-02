@@ -1,0 +1,35 @@
+name = "grimoire"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "grimoire-db"
+database_id = "3cb1cdee-17af-477c-ab0a-5a18447948ef"
+
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "grimoire-atoms"
+
+[vars]
+GEMINI_MODEL = "gemini-2.5-flash"
+AI_GATEWAY_ACCOUNT_ID = "e343cbfa70c5166f00d871e513ae352a"
+AI_GATEWAY_NAME = "hobfarm"
+ALLOWED_ORIGINS = "https://stylefusion.hob.farm,https://sf.hob.farm,https://hob.farm"
+
+# Secrets (set via wrangler secret put):
+# GEMINI_API_KEY
+# AI_GATEWAY_TOKEN
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[observability]
+enabled = true
+
+[limits]
+cpu_ms = 30000

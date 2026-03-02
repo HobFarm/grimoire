@@ -1,0 +1,1 @@
+ALTER TABLE atoms ADD COLUMN modality TEXT NOT NULL DEFAULT 'visual';

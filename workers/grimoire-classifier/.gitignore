@@ -1,0 +1,4 @@
+.env
+node_modules/
+.wrangler/
+.tmp-batch.sql
