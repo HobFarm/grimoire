@@ -288,15 +288,15 @@ async function getExemplars(grimoireDb: D1Database, categories: string[]): Promi
   const exemplars: string[] = []
   for (const cat of categories.slice(0, 3)) {
     const { results } = await grimoireDb.prepare(
-      `SELECT a.text, a.description
+      `SELECT a.text
        FROM atoms a
        WHERE a.category_slug = ? AND a.status = 'confirmed'
        ORDER BY RANDOM()
        LIMIT 2`
-    ).bind(cat).all<{ term: string; description: string | null }>()
+    ).bind(cat).all<{ text: string }>()
 
     for (const row of results ?? []) {
-      exemplars.push(`${cat}: "${row.term}"${row.description ? ` (${row.description.slice(0, 80)})` : ''}`)
+      exemplars.push(`${cat}: "${row.text}"`)
     }
   }
   return exemplars
