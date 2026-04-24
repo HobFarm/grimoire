@@ -1,0 +1,14 @@
+-- NULL sentinel cleanup for UNIQUE index enforcement
+-- Applied 2026-03-18 in batches via wrangler d1 execute:
+--
+-- 1. UPDATE correspondences SET arrangement_scope = '' WHERE arrangement_scope IS NULL (50K rows)
+-- 2. DELETE all remaining NULL arrangement_scope rows in 50K batches (23 batches, ~1.14M duplicates removed)
+-- 3. UPDATE atom_relations SET context = '' WHERE context IS NULL (2 rows)
+--
+-- The correspondences table went from ~1.19M rows to ~50K.
+-- Cron Phase 6 (discover-correspondences) rebuilds the graph via upsert.
+-- New code in correspondence.ts uses ON CONFLICT DO UPDATE instead of INSERT OR IGNORE.
+-- New code in relations.ts uses ON CONFLICT DO UPDATE instead of check-then-insert.
+--
+-- This file exists as documentation. The migration was applied manually in batches
+-- because D1 cannot handle full-table operations on 1M+ row tables in a single transaction.

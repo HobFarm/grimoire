@@ -1,24 +1,22 @@
 /**
  * Atom Arrangement Tagging
  *
- * Computes harmonicSimilarity between every atom's harmonic profile
- * and every arrangement's harmonic profile. Tags atoms with arrangement
- * slugs where similarity >= THRESHOLD.
+ * Scores every atom's harmonic profile against every arrangement's profile
+ * using 6D Euclidean distance (5 harmonic dims + register). Keeps top-N
+ * closest arrangements with distance scores stored in arrangement_tags.
  *
  * Intended to run as:
  *   1. One-shot via admin endpoint POST /admin/tag-arrangements
  *   2. Incrementally via Grimoire cron Phase 4
- *
- * This file exports the core logic. Wire it into index.ts.
  */
 
-interface HarmonicProfile {
-  hardness: 'hard' | 'soft' | 'neutral'
-  temperature: 'warm' | 'cool' | 'neutral'
-  weight: 'heavy' | 'light' | 'neutral'
-  formality: 'structured' | 'organic' | 'neutral'
-  era_affinity: 'archaic' | 'industrial' | 'modern' | 'timeless'
-  register?: number  // 0.0-1.0, null/undefined coalesces to 0.5
+export interface HarmonicProfile {
+  hardness: number
+  temperature: number
+  weight: number
+  formality: number
+  era_affinity: number
+  register?: number
 }
 
 interface ArrangementRow {
@@ -29,55 +27,151 @@ interface ArrangementRow {
   register: number | null
 }
 
-const TAG_THRESHOLD = 0.50
-const BATCH_SIZE = 500
+// Bump TAGGER_VERSION when the scoring algorithm changes to force a full re-tag.
+// currentVersion = Math.max(TAGGER_VERSION, arrangementCount) ensures new
+// arrangements also trigger re-tagging without needing a code change.
+const TAGGER_VERSION = 30
+const TOP_N = 4
+const MAX_DISTANCE = 0.8
 const UPDATE_BATCH_SIZE = 50
 
-const DIMENSION_VECTORS: Record<string, Record<string, number[]>> = {
-  hardness:    { hard: [1, 0], soft: [0, 1], neutral: [0.5, 0.5] },
-  temperature: { warm: [1, 0], cool: [0, 1], neutral: [0.5, 0.5] },
-  weight:      { heavy: [1, 0], light: [0, 1], neutral: [0.5, 0.5] },
-  formality:   { structured: [1, 0], organic: [0, 1], neutral: [0.5, 0.5] },
-  era_affinity: { archaic: [1, 0, 0, 0], industrial: [0, 1, 0, 0], modern: [0, 0, 1, 0], timeless: [0, 0, 0, 1] },
-}
+const HARMONIC_DIMS = ['hardness', 'temperature', 'weight', 'formality', 'era_affinity'] as const
 
-function harmonicSimilarity(a: HarmonicProfile, b: HarmonicProfile): number {
-  const categoricalDims: (keyof HarmonicProfile)[] = [
-    'hardness', 'temperature', 'weight', 'formality', 'era_affinity',
-  ]
-
-  let totalSim = 0
-  for (const dim of categoricalDims) {
-    const vecA = DIMENSION_VECTORS[dim][a[dim] as string] || DIMENSION_VECTORS[dim]['neutral']
-    const vecB = DIMENSION_VECTORS[dim][b[dim] as string] || DIMENSION_VECTORS[dim]['neutral']
-
-    let dot = 0, magA = 0, magB = 0
-    for (let i = 0; i < vecA.length; i++) {
-      dot += vecA[i] * vecB[i]
-      magA += vecA[i] * vecA[i]
-      magB += vecB[i] * vecB[i]
-    }
-    const cos = (magA > 0 && magB > 0) ? dot / (Math.sqrt(magA) * Math.sqrt(magB)) : 0
-    totalSim += cos
+/**
+ * Euclidean distance between two numeric harmonic profiles (6 dimensions: 5 harmonic + register).
+ * Returns 0.0 (identical) to ~2.45 (maximally distant across all 6 dims).
+ */
+function harmonicDistance(
+  atomH: HarmonicProfile,
+  arrH: HarmonicProfile
+): number {
+  let sumSq = 0
+  for (const dim of HARMONIC_DIMS) {
+    const diff = (atomH[dim] ?? 0.5) - (arrH[dim] ?? 0.5)
+    sumSq += diff * diff
   }
-
-  // Register dimension: continuous 0.0-1.0, coalesce null/undefined to 0.5
-  const regA = a.register ?? 0.5
-  const regB = b.register ?? 0.5
-  const rVecA = [regA, 1 - regA]
-  const rVecB = [regB, 1 - regB]
-  const rDot = rVecA[0] * rVecB[0] + rVecA[1] * rVecB[1]
-  const rMagA = Math.sqrt(rVecA[0] * rVecA[0] + rVecA[1] * rVecA[1])
-  const rMagB = Math.sqrt(rVecB[0] * rVecB[0] + rVecB[1] * rVecB[1])
-  const regSim = (rMagA > 0 && rMagB > 0) ? rDot / (rMagA * rMagB) : 0
-  totalSim += regSim
-
-  return totalSim / 6  // 5 categorical + 1 register
+  const regDiff = (atomH.register ?? 0.5) - (arrH.register ?? 0.5)
+  sumSq += regDiff * regDiff
+  return Math.sqrt(sumSq)
 }
 
-function safeParseJSON<T>(raw: string | null | undefined, fallback: T): T {
+export function safeParseJSON<T>(raw: string | null | undefined, fallback: T): T {
   if (!raw) return fallback
   try { return JSON.parse(raw) as T } catch { return fallback }
+}
+
+/**
+ * Load and parse all arrangements from D1. Returns parsed profiles ready for scoring.
+ * Exported for queue consumer use.
+ */
+export async function loadArrangements(db: D1Database): Promise<{
+  arrangements: { slug: string; harmonics: HarmonicProfile }[]
+  currentVersion: number
+}> {
+  const { results } = await db.prepare(
+    'SELECT slug, harmonics, register FROM arrangements'
+  ).all<{ slug: string; harmonics: string; register: number | null }>()
+
+  if (!results || results.length === 0) {
+    return { arrangements: [], currentVersion: TAGGER_VERSION }
+  }
+
+  const currentVersion = Math.max(TAGGER_VERSION, results.length)
+  const arrangements = results.map(r => {
+    const h = safeParseJSON<HarmonicProfile>(r.harmonics, {} as HarmonicProfile)
+    h.register = r.register ?? 0.5
+    return { slug: r.slug, harmonics: h }
+  })
+
+  return { arrangements, currentVersion }
+}
+
+export interface ScoredArrangement {
+  slug: string
+  dist: number
+}
+
+/**
+ * Score a single atom's harmonics against all arrangements.
+ * Returns top-N closest within MAX_DISTANCE, or empty array.
+ * Exported for queue consumer use.
+ *
+ * Signals:
+ * 1. Text containment: if atom text matches an arrangement slug, force-include at dist 0
+ * 2. Harmonic distance: 6D Euclidean distance (5 harmonic dims + register)
+ */
+export function scoreAtom(
+  harmonics: HarmonicProfile,
+  arrangements: { slug: string; harmonics: HarmonicProfile }[],
+  textLower?: string
+): ScoredArrangement[] {
+  const scored: ScoredArrangement[] = []
+  for (const arr of arrangements) {
+    if (typeof arr.harmonics.hardness !== 'number') continue
+
+    // Signal 1: Text containment force-include
+    if (textLower && textLower.length >= 3) {
+      const normalizedSlug = arr.slug.replace(/-/g, ' ')
+      if (textLower.includes(normalizedSlug) || normalizedSlug.includes(textLower)) {
+        scored.push({ slug: arr.slug, dist: 0 })
+        continue
+      }
+    }
+
+    // Signal 2: Harmonic distance
+    const dist = harmonicDistance(harmonics, arr.harmonics)
+    if (dist <= MAX_DISTANCE) {
+      scored.push({ slug: arr.slug, dist: Math.round(dist * 1000) / 1000 })
+    }
+  }
+  scored.sort((a, b) => a.dist - b.dist)
+  return scored.slice(0, TOP_N)
+}
+
+/**
+ * Atomic dual-write: arrangement_atoms join table + arrangement_tags JSON column.
+ * Both writes happen in the same db.batch() for consistency.
+ * Batches 10 atoms at a time (~60 stmts) to stay within D1 limits.
+ */
+export async function dualWriteArrangementTags(
+  db: D1Database,
+  updates: { id: string; newTags: string }[],
+  currentVersion: number
+): Promise<void> {
+  const DUAL_BATCH_SIZE = 10
+
+  for (let i = 0; i < updates.length; i += DUAL_BATCH_SIZE) {
+    const chunk = updates.slice(i, i + DUAL_BATCH_SIZE)
+    const stmts: D1PreparedStatement[] = []
+
+    for (const u of chunk) {
+      // 1. Delete old arrangement_atoms rows for this atom
+      stmts.push(
+        db.prepare('DELETE FROM arrangement_atoms WHERE atom_id = ?').bind(u.id)
+      )
+
+      // 2. Insert new rows (skip 'unaffiliated' sentinel)
+      const tags: { slug: string; dist: number }[] = JSON.parse(u.newTags)
+      for (const tag of tags) {
+        if (tag.slug !== 'unaffiliated') {
+          stmts.push(
+            db.prepare(
+              'INSERT OR REPLACE INTO arrangement_atoms (arrangement_slug, atom_id, distance) VALUES (?, ?, ?)'
+            ).bind(tag.slug, u.id, tag.dist)
+          )
+        }
+      }
+
+      // 3. Update JSON column + tag_version (backward compat)
+      stmts.push(
+        db.prepare(
+          "UPDATE atoms SET arrangement_tags = ?, tag_version = ?, updated_at = datetime('now') WHERE id = ?"
+        ).bind(u.newTags, currentVersion, u.id)
+      )
+    }
+
+    await db.batch(stmts)
+  }
 }
 
 export interface TaggingResult {
@@ -92,7 +186,6 @@ export interface TaggingResult {
  * Caller re-invokes until done=true.
  */
 export async function tagAllAtoms(db: D1Database, batchSize: number = 5000): Promise<TaggingResult> {
-  // Load arrangements
   const { results: arrResults } = await db.prepare(
     'SELECT slug, name, harmonics, category_weights, register FROM arrangements'
   ).all<ArrangementRow>()
@@ -100,6 +193,8 @@ export async function tagAllAtoms(db: D1Database, batchSize: number = 5000): Pro
   if (!arrResults || arrResults.length === 0) {
     return { processed: 0, remaining: 0, done: true, arrangement_coverage: {} }
   }
+
+  const currentVersion = Math.max(TAGGER_VERSION, arrResults.length)
 
   const arrangements = arrResults.map(r => {
     const h = safeParseJSON<HarmonicProfile>(r.harmonics, {} as HarmonicProfile)
@@ -110,10 +205,9 @@ export async function tagAllAtoms(db: D1Database, batchSize: number = 5000): Pro
   const coverage: Record<string, number> = {}
   for (const a of arrangements) coverage[a.slug] = 0
 
-  // Select only untagged atoms with harmonics
   const { results: atoms } = await db.prepare(
-    "SELECT id, harmonics, tags, register FROM atoms WHERE harmonics IS NOT NULL AND LENGTH(harmonics) > 2 AND (tags IS NULL OR tags = '[]' OR tags = '{}' OR LENGTH(tags) <= 2) AND status != 'rejected' LIMIT ?"
-  ).bind(batchSize).all<{ id: string; harmonics: string; tags: string; register: number | null }>()
+    "SELECT id, text_lower, harmonics, register FROM atoms WHERE harmonics IS NOT NULL AND LENGTH(harmonics) > 2 AND tag_version < ? AND status != 'rejected' LIMIT ?"
+  ).bind(currentVersion, batchSize).all<{ id: string; text_lower: string; harmonics: string; register: number | null }>()
 
   if (!atoms || atoms.length === 0) {
     return { processed: 0, remaining: 0, done: true, arrangement_coverage: coverage }
@@ -125,41 +219,23 @@ export async function tagAllAtoms(db: D1Database, batchSize: number = 5000): Pro
     const harmonics = safeParseJSON<HarmonicProfile>(atom.harmonics, {} as HarmonicProfile)
     harmonics.register = atom.register ?? 0.5
 
-    if (!harmonics.hardness && !harmonics.temperature) {
-      // No meaningful harmonics, mark as unaffiliated so it's not re-scanned
-      updates.push({ id: atom.id, newTags: JSON.stringify(['unaffiliated']) })
+    if (typeof harmonics.hardness !== 'number') {
+      updates.push({ id: atom.id, newTags: JSON.stringify([{ slug: 'unaffiliated', dist: 0 }]) })
       continue
     }
 
-    const matchedSlugs: string[] = []
+    const topMatches = scoreAtom(harmonics, arrangements, atom.text_lower)
+    for (const m of topMatches) coverage[m.slug]++
 
-    for (const arr of arrangements) {
-      if (!arr.harmonics.hardness) continue
-      const sim = harmonicSimilarity(harmonics, arr.harmonics)
-      if (sim >= TAG_THRESHOLD) {
-        matchedSlugs.push(arr.slug)
-        coverage[arr.slug]++
-      }
-    }
-
-    const tagsStr = JSON.stringify(matchedSlugs.length > 0 ? matchedSlugs : ['unaffiliated'])
+    const tagsStr = JSON.stringify(topMatches.length > 0 ? topMatches : [{ slug: 'unaffiliated', dist: 0 }])
     updates.push({ id: atom.id, newTags: tagsStr })
   }
 
-  // Batch update in chunks
-  for (let i = 0; i < updates.length; i += UPDATE_BATCH_SIZE) {
-    const chunk = updates.slice(i, i + UPDATE_BATCH_SIZE)
-    const batch = chunk.map(u =>
-      db.prepare("UPDATE atoms SET tags = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(u.newTags, u.id)
-    )
-    await db.batch(batch)
-  }
+  await dualWriteArrangementTags(db, updates, currentVersion)
 
-  // Count remaining
   const { results: countResult } = await db.prepare(
-    "SELECT COUNT(*) as cnt FROM atoms WHERE harmonics IS NOT NULL AND LENGTH(harmonics) > 2 AND (tags IS NULL OR tags = '[]' OR tags = '{}' OR LENGTH(tags) <= 2) AND status != 'rejected'"
-  ).all<{ cnt: number }>()
+    "SELECT COUNT(*) as cnt FROM atoms WHERE harmonics IS NOT NULL AND LENGTH(harmonics) > 2 AND tag_version < ? AND status != 'rejected'"
+  ).bind(currentVersion).all<{ cnt: number }>()
 
   const remaining = countResult?.[0]?.cnt ?? 0
 
@@ -170,15 +246,16 @@ export async function tagAllAtoms(db: D1Database, batchSize: number = 5000): Pro
 
 /**
  * Incremental tagging for cron Phase 4.
- * Tags atoms with harmonics but empty/stale tags. Processes up to `limit` atoms per tick.
+ * Scores atoms against arrangements, writes top-N with distances to arrangement_tags.
  */
 export async function tagNewAtoms(db: D1Database, limit: number = 50): Promise<{ tagged: number; scanned: number }> {
-  // Load arrangements
   const { results: arrResults } = await db.prepare(
     'SELECT slug, harmonics, register FROM arrangements'
   ).all<{ slug: string; harmonics: string; register: number | null }>()
 
   if (!arrResults || arrResults.length === 0) return { tagged: 0, scanned: 0 }
+
+  const currentVersion = Math.max(TAGGER_VERSION, arrResults.length)
 
   const arrangements = arrResults.map(r => {
     const h = safeParseJSON<HarmonicProfile>(r.harmonics, {} as HarmonicProfile)
@@ -186,10 +263,9 @@ export async function tagNewAtoms(db: D1Database, limit: number = 50): Promise<{
     return { slug: r.slug, harmonics: h }
   })
 
-  // Find atoms with harmonics but empty tags
   const { results: atoms } = await db.prepare(
-    "SELECT id, harmonics, tags, register FROM atoms WHERE category_slug IS NOT NULL AND harmonics IS NOT NULL AND LENGTH(harmonics) > 2 AND (tags IS NULL OR tags = '[]' OR tags = '{}' OR LENGTH(tags) <= 2) AND status != 'rejected' LIMIT ?"
-  ).bind(limit).all<{ id: string; harmonics: string; tags: string; register: number | null }>()
+    "SELECT id, text_lower, harmonics, register FROM atoms WHERE category_slug IS NOT NULL AND harmonics IS NOT NULL AND LENGTH(harmonics) > 2 AND tag_version < ? AND status != 'rejected' LIMIT ?"
+  ).bind(currentVersion, limit).all<{ id: string; text_lower: string; harmonics: string; register: number | null }>()
 
   if (!atoms || atoms.length === 0) return { tagged: 0, scanned: 0 }
 
@@ -199,33 +275,20 @@ export async function tagNewAtoms(db: D1Database, limit: number = 50): Promise<{
   for (const atom of atoms) {
     const harmonics = safeParseJSON<HarmonicProfile>(atom.harmonics, {} as HarmonicProfile)
     harmonics.register = atom.register ?? 0.5
-    if (!harmonics.hardness && !harmonics.temperature) continue
 
-    const matchedSlugs: string[] = []
-    for (const arr of arrangements) {
-      if (!arr.harmonics.hardness) continue
-      const sim = harmonicSimilarity(harmonics, arr.harmonics)
-      if (sim >= TAG_THRESHOLD) {
-        matchedSlugs.push(arr.slug)
-      }
+    if (typeof harmonics.hardness !== 'number') {
+      updates.push({ id: atom.id, newTags: JSON.stringify([{ slug: 'unaffiliated', dist: 0 }]) })
+      continue
     }
 
-    // Even if no arrangements match, set tags to empty array so this atom
-    // isn't re-processed on subsequent cron ticks
-    const tagsStr = JSON.stringify(matchedSlugs.length > 0 ? matchedSlugs : ['unaffiliated'])
+    const topMatches = scoreAtom(harmonics, arrangements, atom.text_lower)
+
+    const tagsStr = JSON.stringify(topMatches.length > 0 ? topMatches : [{ slug: 'unaffiliated', dist: 0 }])
     updates.push({ id: atom.id, newTags: tagsStr })
-    if (matchedSlugs.length > 0) tagged++
+    if (topMatches.length > 0) tagged++
   }
 
-  // Batch update
-  for (let i = 0; i < updates.length; i += UPDATE_BATCH_SIZE) {
-    const chunk = updates.slice(i, i + UPDATE_BATCH_SIZE)
-    const batch = chunk.map(u =>
-      db.prepare("UPDATE atoms SET tags = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(u.newTags, u.id)
-    )
-    await db.batch(batch)
-  }
+  await dualWriteArrangementTags(db, updates, currentVersion)
 
   return { tagged, scanned: atoms.length }
 }

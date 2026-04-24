@@ -20,6 +20,35 @@ import type {
 } from '@shared/rpc/pipeline-types'
 import type { BlogChannel } from './blog/types'
 
+const CRON_TTL = 7 * 24 * 60 * 60 // 7 days
+
+async function trackCron(
+  env: { PROVIDER_HEALTH: KVNamespace },
+  phase: string,
+  fn: () => Promise<Record<string, unknown>>,
+): Promise<void> {
+  const startedAt = new Date().toISOString()
+  const start = Date.now()
+  let status: 'success' | 'error' = 'success'
+  let error: string | undefined
+  let meta: Record<string, unknown> = {}
+  try {
+    meta = await fn()
+  } catch (e) {
+    status = 'error'
+    error = e instanceof Error ? e.message : String(e)
+    console.log(`[cron] ${phase} failed: ${error}`)
+  } finally {
+    try {
+      await env.PROVIDER_HEALTH.put(
+        `cron:last:hobbot-pipeline:${phase}`,
+        JSON.stringify({ worker: 'hobbot-pipeline', phase, startedAt, completedAt: new Date().toISOString(), durationMs: Date.now() - start, status, error, meta }),
+        { expirationTtl: CRON_TTL },
+      )
+    } catch { /* don't break cron for KV write failure */ }
+  }
+}
+
 export interface Env {
   GRIMOIRE_DB: D1Database
   HOBBOT_DB: D1Database
@@ -32,11 +61,20 @@ export interface Env {
   GITHUB_TOKEN: string
   ENVIRONMENT: 'development' | 'production'
   SELF_URL: string
-  INTERNAL_SECRET: string
+  INTERNAL_SECRET: string | { get: () => Promise<string> }
+  SERVICE_TOKENS: string | { get: () => Promise<string> }
 }
 
 // RPC entrypoint: gateway delegates pipeline operations here
 export class PipelineEntrypoint extends WorkerEntrypoint<Env> {
+  // Service-binding fetch: gateway binds with entrypoint = "PipelineEntrypoint",
+  // so .fetch() lands here instead of the module default. Delegate to the default
+  // handler so /internal/* routes (ingest-async, enrich-trigger, rss-ingest) remain
+  // reachable from the gateway.
+  async fetch(request: Request): Promise<Response> {
+    return defaultHandler.fetch(request, this.env, this.ctx)
+  }
+
   async ingestFromUrl(params: IngestFromUrlParams): Promise<PipelineResult> {
     const adapterResult = await fromUrl(this.env, params)
     if (adapterResult.already_ingested) {
@@ -164,11 +202,11 @@ export class PipelineEntrypoint extends WorkerEntrypoint<Env> {
   }
 
   async runBlogPipeline(channel?: string) {
-    return runBlogPipeline(this.env as any, (channel ?? 'blog') as BlogChannel)
+    return runBlogPipeline(this.env, (channel ?? 'blog') as BlogChannel)
   }
 
   async runBridge() {
-    return runBridge(this.env as any)
+    return runBridge(this.env)
   }
 
   async publishDraft(id: number) {
@@ -184,12 +222,111 @@ export class PipelineEntrypoint extends WorkerEntrypoint<Env> {
   }
 }
 
-export default {
+const defaultHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
 
+    // Async ingest trigger (called by gateway MCP tools for non-blocking ingestion)
+    if (url.pathname === '/internal/ingest-async' && request.method === 'POST') {
+      const body = await request.json() as { url: string; source_type?: string; collection_slug?: string; batch_id?: string; tags?: string[] }
+      ctx.waitUntil((async () => {
+        try {
+          const adapterResult = await fromUrl(env, {
+            url: body.url,
+            source_type: (body.source_type ?? 'domain') as 'aesthetic' | 'domain',
+            collection_slug: body.collection_slug,
+            dry_run: false,
+          })
+          if (adapterResult.already_ingested) {
+            console.log(`[ingest-async] already ingested: ${body.url}`)
+            if (body.batch_id) {
+              await env.HOBBOT_DB.prepare(
+                `UPDATE ingestion_batch_items SET status = 'skipped', completed_at = datetime('now') WHERE batch_id = ? AND url = ?`
+              ).bind(body.batch_id, body.url).run()
+            }
+            return
+          }
+          if (!adapterResult.doc) {
+            console.log(`[ingest-async] no document: ${body.url}`)
+            if (body.batch_id) {
+              await env.HOBBOT_DB.prepare(
+                `UPDATE ingestion_batch_items SET status = 'failed', error = 'no document from adapter', completed_at = datetime('now') WHERE batch_id = ? AND url = ?`
+              ).bind(body.batch_id, body.url).run()
+            }
+            return
+          }
+          const result = await runKnowledgePipeline(env, adapterResult.doc, {
+            logId: adapterResult.logId,
+            sourceId: adapterResult.sourceId,
+            documentId: adapterResult.documentId,
+          })
+          console.log(`[ingest-async] completed: ${body.url} chunks=${result.chunks_created} atoms=${result.atoms_created}`)
+          if (body.batch_id) {
+            await env.HOBBOT_DB.prepare(
+              `UPDATE ingestion_batch_items SET status = 'completed', document_id = ?, completed_at = datetime('now') WHERE batch_id = ? AND url = ?`
+            ).bind(result.document_id, body.batch_id, body.url).run()
+          }
+        } catch (e) {
+          const error = e instanceof Error ? e.message : String(e)
+          console.error(`[ingest-async] failed: ${body.url} - ${error}`)
+          if (body.batch_id) {
+            await env.HOBBOT_DB.prepare(
+              `UPDATE ingestion_batch_items SET status = 'failed', error = ?, completed_at = datetime('now') WHERE batch_id = ? AND url = ?`
+            ).bind(error.slice(0, 500), body.batch_id, body.url).run()
+          }
+        }
+        // Update batch-level completion if all items are done
+        if (body.batch_id) {
+          try {
+            const pending = await env.HOBBOT_DB.prepare(
+              `SELECT count(*) as cnt FROM ingestion_batch_items WHERE batch_id = ? AND status = 'queued'`
+            ).bind(body.batch_id).first<{ cnt: number }>()
+            if (pending && pending.cnt === 0) {
+              const stats = await env.HOBBOT_DB.prepare(
+                `SELECT sum(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed, sum(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed FROM ingestion_batch_items WHERE batch_id = ?`
+              ).bind(body.batch_id).first<{ completed: number; failed: number }>()
+              await env.HOBBOT_DB.prepare(
+                `UPDATE ingestion_batches SET completed = ?, failed = ?, completed_at = datetime('now') WHERE id = ?`
+              ).bind(stats?.completed ?? 0, stats?.failed ?? 0, body.batch_id).run()
+              console.log(`[ingest-async] batch ${body.batch_id} complete: ${stats?.completed} ok, ${stats?.failed} failed`)
+            }
+          } catch { /* non-fatal */ }
+        }
+      })())
+      return new Response(JSON.stringify({ ok: true, accepted: true, url: body.url }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    // Enrichment trigger (called by gateway admin tool via service binding)
+    if (url.pathname === '/internal/enrich-trigger' && request.method === 'POST') {
+      ctx.waitUntil(
+        enrichChunksBatched(env, ctx, 0, 0)
+          .then(r => console.log(`[enrich-trigger] enriched=${r.enriched} failed=${r.failed}`))
+          .catch(e => console.error(`[enrich-trigger] error: ${e instanceof Error ? e.message : e}`))
+      )
+      return new Response(JSON.stringify({ ok: true, triggered: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    // Immediate RSS ingest trigger (called by custodian after writing feed_entries)
+    if (url.pathname === '/internal/rss-ingest' && request.method === 'POST') {
+      ctx.waitUntil(
+        processRssIngestQueue(env)
+          .then(r => console.log(`[rss-trigger] processed=${r.processed} failed=${r.failed}`))
+          .catch(e => console.error(`[rss-trigger] error: ${e instanceof Error ? e.message : e}`))
+      )
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
     if (url.pathname === '/internal/enrich-continue' && request.method === 'POST') {
-      if (env.INTERNAL_SECRET && request.headers.get('x-internal-secret') !== env.INTERNAL_SECRET) {
+      const internalSecret = typeof env.INTERNAL_SECRET === 'string'
+        ? env.INTERNAL_SECRET
+        : await env.INTERNAL_SECRET?.get() ?? ''
+      if (internalSecret && request.headers.get('x-internal-secret') !== internalSecret) {
         return new Response('unauthorized', { status: 401 })
       }
       const depth = parseInt(url.searchParams.get('depth') ?? '0', 10)
@@ -211,33 +348,35 @@ export default {
 
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     if (event.cron === '0 */6 * * *') {
-      ctx.waitUntil(
-        enrichChunksBatched(env, ctx, 0, 0)
-          .then(r => console.log(`[cron] chunk-enrich: enriched=${r.enriched} failed=${r.failed} docs_completed=${r.documents_completed.length}`))
-          .catch(e => console.log(`[cron] chunk-enrich failed: ${e instanceof Error ? e.message : e}`))
-      )
-      ctx.waitUntil(
-        processStyleFusionOutcomes(env)
-          .then(r => console.log(`[cron] sf-outcomes: exported=${r.exported} failed=${r.failed}`))
-          .catch(e => console.log(`[cron] sf-outcomes failed: ${e instanceof Error ? e.message : e}`))
-      )
-      ctx.waitUntil(
-        processRssIngestQueue(env)
-          .then(r => console.log(`[cron] rss-ingest: processed=${r.processed} failed=${r.failed}`))
-          .catch(e => console.log(`[cron] rss-ingest failed: ${e instanceof Error ? e.message : e}`))
-      )
+      ctx.waitUntil(trackCron(env, 'enrichment', async () => {
+        const r = await enrichChunksBatched(env, ctx, 0, 0)
+        console.log(`[cron] chunk-enrich: enriched=${r.enriched} failed=${r.failed} docs_completed=${r.documents_completed.length}`)
+        return { enriched: r.enriched, failed: r.failed, docs_completed: r.documents_completed.length }
+      }))
+      ctx.waitUntil(trackCron(env, 'sf-outcomes', async () => {
+        const r = await processStyleFusionOutcomes(env)
+        console.log(`[cron] sf-outcomes: exported=${r.exported} failed=${r.failed}`)
+        return { exported: r.exported, failed: r.failed }
+      }))
+      ctx.waitUntil(trackCron(env, 'rss-ingest', async () => {
+        const r = await processRssIngestQueue(env)
+        console.log(`[cron] rss-ingest: processed=${r.processed} failed=${r.failed}`)
+        return { processed: r.processed, failed: r.failed }
+      }))
     } else if (event.cron === '0 5 * * *') {
-      ctx.waitUntil(
-        runBridge(env as any)
-          .then(r => console.log(`[cron] bridge: scanned=${r.candidatesScanned} queued=${r.queued}`))
-          .catch(e => console.log(`[cron] bridge failed: ${e instanceof Error ? e.message : e}`))
-      )
+      ctx.waitUntil(trackCron(env, 'bridge', async () => {
+        const r = await runBridge(env)
+        console.log(`[cron] bridge: scanned=${r.candidatesScanned} queued=${r.queued}`)
+        return { scanned: r.candidatesScanned, queued: r.queued }
+      }))
     } else if (event.cron === '0 8 * * *') {
-      ctx.waitUntil(
-        runBlogPipeline(env as any)
-          .then(r => console.log(`[cron] blog: success=${r.success} noop=${r.noop} slug=${r.slug ?? '-'}`))
-          .catch(e => console.log(`[cron] blog failed: ${e instanceof Error ? e.message : e}`))
-      )
+      ctx.waitUntil(trackCron(env, 'blog', async () => {
+        const r = await runBlogPipeline(env)
+        console.log(`[cron] blog: success=${r.success} noop=${r.noop} slug=${r.slug ?? '-'}`)
+        return { success: r.success, noop: r.noop, slug: r.slug ?? null }
+      }))
     }
   },
 }
+
+export default defaultHandler

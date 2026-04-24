@@ -1,33 +1,43 @@
 /**
  * Grimoire Batch Classifier
- * 
- * Assigns category_slug and harmonics to uncategorized atoms via Gemini.
+ *
+ * Assigns category_slug and harmonics to uncategorized atoms.
+ * Workers AI (Nemotron) primary, Gemini fallback, circuit breaker.
  * Run as: POST /classify?batch_size=50&collection=style
  * Or run all: POST /classify?batch_size=50
- * 
+ *
  * Designed for manual triggering, not cron. Run it, watch the logs,
  * iterate on prompt if classification quality needs tuning.
+ *
+ * Categories are fetched from GRIMOIRE_DB at runtime, not hardcoded.
  */
+
+import { callClassifier } from './ai'
 
 interface Env {
   GRIMOIRE_DB: D1Database
-  AI_GATEWAY_URL: string  // gateway.ai.cloudflare.com/v1/{account}/hobfarm
+  HOBBOT_DB: D1Database
+  AI: Ai
+  AI_GATEWAY_ACCOUNT_ID: string
+  AI_GATEWAY_NAME: string
   GEMINI_API_KEY: string
+  AI_GATEWAY_TOKEN: string
+  PROVIDER_HEALTH: KVNamespace
 }
 
-// The five cymatics dimensions
-type Hardness = 'hard' | 'soft' | 'neutral'
-type Temperature = 'warm' | 'cool' | 'neutral'
-type Weight = 'heavy' | 'light' | 'neutral'
-type Formality = 'structured' | 'organic' | 'neutral'
-type EraAffinity = 'archaic' | 'industrial' | 'modern' | 'timeless'
-
+// The five cymatics dimensions (all numeric 0.0-1.0)
 interface HarmonicProfile {
-  hardness: Hardness
-  temperature: Temperature
-  weight: Weight
-  formality: Formality
-  era_affinity: EraAffinity
+  hardness: number      // 0.0 (soft) to 1.0 (hard)
+  temperature: number   // 0.0 (cool) to 1.0 (warm)
+  weight: number        // 0.0 (light) to 1.0 (heavy)
+  formality: number     // 0.0 (organic) to 1.0 (structured)
+  era_affinity: number  // 0.0 (ancient) to 1.0 (futuristic)
+}
+
+function clampScore(v: unknown): number {
+  const n = typeof v === 'number' ? v : parseFloat(String(v))
+  if (isNaN(n)) return 0.5
+  return Math.max(0, Math.min(1, n))
 }
 
 interface ClassificationResult {
@@ -43,21 +53,31 @@ interface AtomRow {
   collection_slug: string
 }
 
-// Valid category slugs for Gemini to choose from
-const VALID_CATEGORIES = [
-  'camera.lens', 'camera.shot', 'color.palette',
-  'covering.accessory', 'covering.clothing', 'covering.footwear',
-  'covering.headwear', 'covering.material', 'covering.outfit',
-  'environment.atmosphere', 'environment.prop', 'environment.setting',
-  'lighting.source', 'negative.filter',
-  'object.drink', 'object.held',
-  'pose.interaction', 'pose.position',
-  'style.era', 'style.genre', 'style.medium',
-  'subject.expression', 'subject.face', 'subject.feature',
-  'subject.form', 'subject.hair'
-]
+interface CategoryMetadata {
+  slug: string
+  description: string
+  default_modality: string
+}
 
-const CLASSIFICATION_PROMPT = `You are classifying visual prompt atoms for an AI image generation system called the Grimoire.
+async function getCategoryMetadata(db: D1Database): Promise<CategoryMetadata[]> {
+  const res = await db.prepare(
+    'SELECT slug, description, default_modality FROM categories ORDER BY slug'
+  ).all<CategoryMetadata>()
+  return res.results
+}
+
+/**
+ * Build classification prompt from DB-sourced categories.
+ * Groups by default_modality to match the model's expected format.
+ */
+function buildClassifierPrompt(categories: CategoryMetadata[]): string {
+  const visual = categories.filter(c => c.default_modality === 'visual')
+  const narrative = categories.filter(c => c.default_modality === 'narrative')
+  const both = categories.filter(c => c.default_modality === 'both')
+
+  const formatCat = (c: CategoryMetadata) => `- ${c.slug}: ${c.description}`
+
+  return `You are classifying visual prompt atoms for an AI image generation system called the Grimoire.
 
 Each atom is a short text term (1-5 words) that describes a visual element used in image composition prompts. Your job is to assign each atom:
 
@@ -65,115 +85,91 @@ Each atom is a short text term (1-5 words) that describes a visual element used 
 2. A harmonic profile with exactly 5 dimensions
 
 VALID CATEGORIES:
-${VALID_CATEGORIES.map(c => `- ${c}`).join('\n')}
 
-Category descriptions:
-- camera.lens: Focal length, depth of field, distortion, bokeh. Technical camera properties.
-- camera.shot: Camera framing and angle. Close-up, medium, wide, bird-eye, worm-eye.
-- color.palette: Color terms, hex values, color harmony, tint, saturation, hue references.
-- covering.accessory: Jewelry, belts, watches, cuffs, bracelets, earrings. Removable body accessories.
-- covering.clothing: Garments worn on the body. Dresses, suits, shirts, pants, robes, armor.
-- covering.footwear: Shoes, boots, sandals, stockings, legwear.
-- covering.headwear: Hats, helmets, crowns, tiaras, headbands, veils, hoods.
-- covering.material: Fabrics, textures, surface treatments on clothing. Leather, silk, lace, velvet, denim. Also prints/patterns.
-- covering.outfit: Complete themed ensembles. Cottagecore, steampunk, gothic. Coordinated looks.
-- environment.atmosphere: Physical atmospheric conditions ONLY. Smoke, fog, rain, dust, particles, mist.
-- environment.prop: Objects in scene NOT worn or held. Furniture, vehicles, architectural elements.
-- environment.setting: Where the scene takes place. Locations, venues, landscapes.
-- lighting.source: Where light comes from and its quality. Key light, fill, rim, neon, candles.
-- negative.filter: Terms to STRIP from prompts. Interpretation words (young, happy, mysterious), mood words.
-- object.drink: Beverage vessels and components. Glass type, liquid, garnish, ice.
-- object.held: Things the subject holds. Weapons, drinks, tools, cigarettes.
-- pose.interaction: How subject physically interacts with objects or self. Holding, gripping, touching.
-- pose.position: Body arrangement and posture. Standing, sitting, kneeling, leaning.
-- style.era: Time period context. 1920s, Victorian, Medieval, Futuristic.
-- style.genre: Aesthetic category. Noir, cyberpunk, steampunk, art deco, gothic.
-- style.medium: Rendering approach. Photography, oil painting, watercolor, 3D render.
-- subject.expression: Facial muscle positions and eye state. Physical configuration, NOT mood.
-- subject.face: Specific facial features. Eye color, skin texture, cosmetics.
-- subject.feature: Distinguishing marks. Tattoos, scars, piercings, bioluminescence.
-- subject.form: What the subject IS structurally. Figure type, body proportions.
-- subject.hair: Hair style, length, texture, color. Includes facial hair.
+VISUAL CATEGORIES:
+${visual.map(formatCat).join('\n')}
 
-HARMONIC DIMENSIONS (assign exactly one value per dimension):
-- hardness: "hard" (rigid, angular, sharp edges, stiff, armor-like, geometric) | "soft" (flowing, draped, rounded, gentle, yielding, plush) | "neutral" (RARE: only when truly ambiguous)
-- temperature: "warm" (reds, oranges, golden, amber, fire, candlelight, earth tones, copper, brass) | "cool" (blues, greens, silver, ice, steel, chrome, moonlight, slate) | "neutral" (RARE: only for colorless or truly achromatic terms)
-- weight: "heavy" (dense, thick, substantial, layered, grounded, massive, opaque) | "light" (thin, sheer, delicate, ethereal, airy, transparent, minimal) | "neutral" (RARE: only when visual mass is truly indeterminate)
-- formality: "structured" (geometric, precise, manufactured, tailored, engineered, symmetrical) | "organic" (natural, irregular, weathered, grown, handmade, asymmetrical) | "neutral" (RARE: only when neither applies)
-- era_affinity: "archaic" (ancient, medieval, mythological, primitive, pre-industrial) | "industrial" (1880s-1960s, machine age, art deco, noir, riveted, welded) | "modern" (contemporary, digital, futuristic, synthetic, neon) | "timeless" (genuinely era-independent basics like "sleeve" or "button")
+NARRATIVE CATEGORIES:
+${narrative.map(formatCat).join('\n')}
 
-CRITICAL: "neutral" and "timeless" are NOT defaults. They are rare exceptions for genuinely ambiguous atoms. Most visual terms carry bias. Examples:
-- "long sleeves" -> formality:structured (constructed garment), weight:neutral, era_affinity:timeless
-- "fingerless design" -> formality:structured (deliberate cutaway), era_affinity:modern (punk/tactical association)
-- "black fabric" -> temperature:cool (black reads cool), weight:heavy (dark = visual weight)
-- "loose cloak" -> formality:organic (draping), weight:heavy (full coverage), era_affinity:archaic
-- "neon glow" -> temperature:cool, hardness:hard (sharp light edges), era_affinity:modern
-- "leather" -> hardness:hard, temperature:warm (earth material), formality:structured, era_affinity:industrial
-- "lace" -> hardness:soft, weight:light, formality:organic (handcraft pattern)
+DUAL-MODE CATEGORIES:
+${both.map(formatCat).join('\n')}
 
-Think about what this term LOOKS LIKE in an image. Commit to its visual tendency even if weak. A slight lean is better than neutral.
+HARMONIC DIMENSIONS (assign a float value 0.0 to 1.0 for each):
+- hardness: 0.0 = soft, flowing, draped, rounded, gentle, yielding, plush. 1.0 = hard, rigid, angular, sharp edges, stiff, armor-like, geometric. 0.5 = genuinely ambiguous (RARE).
+- temperature: 0.0 = cool, blues, greens, silver, ice, steel, chrome, moonlight, slate. 1.0 = warm, reds, oranges, golden, amber, fire, candlelight, earth tones, copper, brass. 0.5 = genuinely achromatic (RARE).
+- weight: 0.0 = light, thin, sheer, delicate, ethereal, airy, transparent, minimal. 1.0 = heavy, dense, thick, substantial, layered, grounded, massive, opaque. 0.5 = genuinely indeterminate (RARE).
+- formality: 0.0 = organic, natural, irregular, weathered, grown, handmade, asymmetrical. 1.0 = structured, geometric, precise, manufactured, tailored, engineered, symmetrical. 0.5 = genuinely neither (RARE).
+- era_affinity: 0.0 = ancient, medieval, mythological, primitive, pre-industrial. 0.4 = industrial, 1880s-1960s, machine age, art deco, noir. 0.8 = modern, contemporary, digital, futuristic, synthetic, neon. 0.5 = genuinely era-independent (RARE, like "sleeve" or "button").
+
+CRITICAL: 0.5 is NOT a default. It is a rare exception for genuinely ambiguous atoms. Most visual terms carry directional bias. Commit to a lean even if slight. A value of 0.35 or 0.65 is better than 0.5.
+
+Examples:
+- "long sleeves" -> formality:0.7 (constructed garment), weight:0.5, era_affinity:0.5
+- "fingerless design" -> formality:0.75 (deliberate cutaway), era_affinity:0.8 (punk/tactical)
+- "black fabric" -> temperature:0.2 (black reads cool), weight:0.75 (dark = visual weight)
+- "loose cloak" -> formality:0.15 (draping), weight:0.8 (full coverage), era_affinity:0.1
+- "neon glow" -> temperature:0.15, hardness:0.85 (sharp light edges), era_affinity:0.9
+- "leather" -> hardness:0.8, temperature:0.7 (earth material), formality:0.8, era_affinity:0.4
+- "lace" -> hardness:0.15, weight:0.2, formality:0.2 (handcraft pattern)
+
+Think about what this term LOOKS LIKE in an image. A slight lean is better than center.
 
 The atom's current collection provides context but may be wrong (that is why we are reclassifying).
 
 Respond with ONLY a JSON array. No markdown, no explanation. Each element:
-{"id":"atom_id","cat":"category_slug","h":{"hardness":"...","temperature":"...","weight":"...","formality":"...","era_affinity":"..."}}
+{"id":"atom_id","cat":"category_slug","h":{"hardness":0.0,"temperature":0.0,"weight":0.0,"formality":0.0,"era_affinity":0.0}}
 `
+}
 
 async function classifyBatch(
   atoms: AtomRow[],
-  env: Env
+  env: Env,
+  categories: CategoryMetadata[]
 ): Promise<ClassificationResult[]> {
-  const atomList = atoms.map(a => 
+  const validSlugs = new Set(categories.map(c => c.slug))
+  const prompt = buildClassifierPrompt(categories)
+
+  const atomList = atoms.map(a =>
     `- id:${a.id} text:"${a.text_lower}" collection:${a.collection_slug}`
   ).join('\n')
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': env.GEMINI_API_KEY,
-      },
-      body: JSON.stringify({
-        contents: [{
-          parts: [{
-            text: CLASSIFICATION_PROMPT + '\n\nATOMS TO CLASSIFY:\n' + atomList
-          }]
-        }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
-          maxOutputTokens: 8192,
-        }
-      })
-    }
-  )
+  const result = await callClassifier(env, prompt, 'ATOMS TO CLASSIFY:\n' + atomList)
 
-  if (!response.ok) {
-    const err = await response.text()
-    throw new Error(`Gemini API error ${response.status}: ${err}`)
+  // Strip markdown fences if present, parse JSON
+  let cleaned = result.text.trim()
+  if (cleaned.startsWith('```')) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '')
   }
+  const parsed = JSON.parse(cleaned)
 
-  const data = await response.json() as any
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text
-  if (!text) throw new Error('Empty Gemini response')
+  // Handle bare array or wrapped object (e.g. { results: [...] })
+  const raw: unknown[] = Array.isArray(parsed)
+    ? parsed
+    : (parsed.results ?? parsed.classifications ?? [])
 
-  const parsed: Array<{id: string, cat: string, h: HarmonicProfile}> = JSON.parse(text)
+  // Normalize keys: accept both short (cat, h) and full (category_slug, harmonics) formats
+  const normalized = raw.map((r: any) => ({
+    id: r.id,
+    cat: r.cat ?? r.category_slug ?? r.category,
+    h: r.h ?? r.harmonic_profile ?? r.harmonics,
+  }))
 
-  // Validate and transform
-  return parsed
-    .filter(r => VALID_CATEGORIES.includes(r.cat))
+  console.log(`[classify] ${atoms.length} atoms by ${result.provider}/${result.model} (${result.durationMs}ms)`)
+
+  // Validate against DB-sourced category set
+  return normalized
+    .filter(r => validSlugs.has(r.cat))
     .map(r => ({
       atom_id: r.id,
       text: atoms.find(a => a.id === r.id)?.text_lower || '',
       category_slug: r.cat,
       harmonics: {
-        hardness: (['hard','soft','neutral'].includes(r.h.hardness) ? r.h.hardness : 'neutral') as Hardness,
-        temperature: (['warm','cool','neutral'].includes(r.h.temperature) ? r.h.temperature : 'neutral') as Temperature,
-        weight: (['heavy','light','neutral'].includes(r.h.weight) ? r.h.weight : 'neutral') as Weight,
-        formality: (['structured','organic','neutral'].includes(r.h.formality) ? r.h.formality : 'neutral') as Formality,
-        era_affinity: (['archaic','industrial','modern','timeless'].includes(r.h.era_affinity) ? r.h.era_affinity : 'timeless') as EraAffinity,
+        hardness: clampScore(r.h?.hardness),
+        temperature: clampScore(r.h?.temperature),
+        weight: clampScore(r.h?.weight),
+        formality: clampScore(r.h?.formality),
+        era_affinity: clampScore(r.h?.era_affinity),
       }
     }))
 }
@@ -207,17 +203,17 @@ export default {
 
     if (url.pathname === '/status') {
       const stats = await env.GRIMOIRE_DB.prepare(`
-        SELECT 
+        SELECT
           COUNT(*) as total,
           SUM(CASE WHEN category_slug IS NOT NULL THEN 1 ELSE 0 END) as categorized,
           SUM(CASE WHEN harmonics != '{}' AND harmonics IS NOT NULL THEN 1 ELSE 0 END) as has_harmonics,
           SUM(CASE WHEN category_slug IS NULL THEN 1 ELSE 0 END) as uncategorized
         FROM atoms
       `).first()
-      
+
       const byCollection = await env.GRIMOIRE_DB.prepare(`
-        SELECT collection_slug, COUNT(*) as cnt 
-        FROM atoms WHERE category_slug IS NULL 
+        SELECT collection_slug, COUNT(*) as cnt
+        FROM atoms WHERE category_slug IS NULL
         GROUP BY collection_slug ORDER BY cnt DESC
       `).all()
 
@@ -228,6 +224,9 @@ export default {
       const batchSize = parseInt(url.searchParams.get('batch_size') || '50')
       const collection = url.searchParams.get('collection')
       const dryRun = url.searchParams.get('dry_run') === 'true'
+
+      // Fetch categories from DB at runtime
+      const categories = await getCategoryMetadata(env.GRIMOIRE_DB)
 
       // Pull uncategorized atoms
       let query = 'SELECT id, text_lower, collection_slug FROM atoms WHERE category_slug IS NULL'
@@ -241,21 +240,22 @@ export default {
       const stmt = collection
         ? env.GRIMOIRE_DB.prepare(query).bind(collection)
         : env.GRIMOIRE_DB.prepare(query)
-      
+
       const { results: atoms } = await stmt.all<AtomRow>()
 
       if (!atoms || atoms.length === 0) {
         return Response.json({ message: 'No uncategorized atoms found', collection })
       }
 
-      // Classify with Gemini
-      const classified = await classifyBatch(atoms, env)
+      // Classify with AI (categories from DB)
+      const classified = await classifyBatch(atoms, env, categories)
 
       if (dryRun) {
         return Response.json({
           dry_run: true,
           input_count: atoms.length,
           classified_count: classified.length,
+          categories_available: categories.length,
           sample: classified.slice(0, 10),
           dropped: atoms.length - classified.length
         })
@@ -276,9 +276,12 @@ export default {
     // Harmonics-only pass for already-categorized atoms
     if (url.pathname === '/harmonize' && request.method === 'POST') {
       const batchSize = parseInt(url.searchParams.get('batch_size') || '50')
-      
+
+      // Fetch categories from DB at runtime
+      const categories = await getCategoryMetadata(env.GRIMOIRE_DB)
+
       const { results: atoms } = await env.GRIMOIRE_DB.prepare(`
-        SELECT id, text_lower, collection_slug FROM atoms 
+        SELECT id, text_lower, collection_slug FROM atoms
         WHERE category_slug IS NOT NULL AND (harmonics = '{}' OR harmonics IS NULL)
         LIMIT ?
       `).bind(Math.min(batchSize, 100)).all<AtomRow>()
@@ -287,8 +290,8 @@ export default {
         return Response.json({ message: 'All categorized atoms have harmonics' })
       }
 
-      const classified = await classifyBatch(atoms, env)
-      
+      const classified = await classifyBatch(atoms, env, categories)
+
       // Only update harmonics, keep existing category_slug
       const stmts = classified.map(r =>
         env.GRIMOIRE_DB.prepare(

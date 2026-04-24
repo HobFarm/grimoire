@@ -1,5 +1,4 @@
 import type {
-  Env,
   ClassifyRequest,
   ClassifyResponse,
   ResolvedCategory,
@@ -10,7 +9,9 @@ import type {
 } from './types'
 import { resolveCategories, getContextGuidance, getRelevantRelations, getAllSlugs } from './db'
 import { getCachedResults, writeCacheResults } from './cache'
-import { fetchGeminiText, tryParseJson } from './gemini'
+import { tryParseJson } from './gemini'
+import { type ModelContext } from './models'
+import { callWithFallback } from './provider'
 
 // --- Prompt Construction ---
 
@@ -76,13 +77,11 @@ function validateClassificationShape(parsed: unknown): GeminiClassificationResul
 }
 
 /**
- * Call Gemini via AI Gateway. Owns retry logic: if first response is unparseable JSON,
- * retries once with stricter suffix. If retry also fails, throws.
+ * Call AI provider via callWithFallback. Owns retry logic: if first response is
+ * unparseable JSON, retries once with stricter suffix. If retry also fails, throws.
  */
-export async function callGemini(env: Env, prompt: string): Promise<GeminiClassificationResult> {
-  const model = env.GEMINI_MODEL || 'gemini-2.5-flash'
-
-  const rawText = await fetchGeminiText(env, model, prompt)
+export async function callGemini(ctx: ModelContext, prompt: string): Promise<GeminiClassificationResult> {
+  const { result: rawText } = await callWithFallback(ctx, 'classify.text', prompt)
 
   // First parse attempt
   const firstTry = tryParseJson<GeminiClassificationResult>(rawText, validateClassificationShape)
@@ -90,11 +89,11 @@ export async function callGemini(env: Env, prompt: string): Promise<GeminiClassi
 
   // Retry with stricter prompt
   const stricterPrompt = prompt + '\n\nIMPORTANT: Respond with a JSON object only. No markdown, no explanation, no code fences. The response must be parseable by JSON.parse().'
-  const retryText = await fetchGeminiText(env, model, stricterPrompt)
+  const { result: retryText } = await callWithFallback(ctx, 'classify.text', stricterPrompt)
   const secondTry = tryParseJson<GeminiClassificationResult>(retryText, validateClassificationShape)
   if (secondTry) return secondTry
 
-  throw new Error(`Gemini returned unparseable JSON after retry. Raw: ${retryText.slice(0, 200)}`)
+  throw new Error(`Provider returned unparseable JSON after retry. Raw: ${retryText.slice(0, 200)}`)
 }
 
 // --- Schema Validation ---
@@ -234,7 +233,8 @@ export class ClassifyError extends Error {
  * INGEST -> MEDIATE -> EXECUTE -> VALIDATE -> DELIVER
  */
 export async function classifyText(
-  env: Env,
+  db: D1Database,
+  ctx: ModelContext,
   request: ClassifyRequest
 ): Promise<ClassifyResponse> {
   // --- INGEST ---
@@ -245,9 +245,9 @@ export async function classifyText(
     throw new ClassifyError('categories array is required', 400)
   }
 
-  const categories = await resolveCategories(env.DB, request.categories)
+  const categories = await resolveCategories(db, request.categories)
   if (categories.length === 0) {
-    const validSlugs = await getAllSlugs(env.DB)
+    const validSlugs = await getAllSlugs(db)
     throw new ClassifyError('No categories matched the provided patterns', 400, {
       valid_slugs: validSlugs,
     })
@@ -258,12 +258,12 @@ export async function classifyText(
 
   // --- MEDIATE ---
   const categorySlugs = categories.map(c => c.slug)
-  const contextGuidance = await getContextGuidance(env.DB, categorySlugs, contexts)
-  const relations = await getRelevantRelations(env.DB, categorySlugs)
+  const contextGuidance = await getContextGuidance(db, categorySlugs, contexts)
+  const relations = await getRelevantRelations(db, categorySlugs)
   const contextUsed = [...new Set(contextGuidance.map(c => c.context))]
 
   // --- EXECUTE ---
-  const cached = await getCachedResults(env.DB, request.text, categorySlugs, contexts)
+  const cached = await getCachedResults(db, request.text, categorySlugs, contexts)
   const uncachedCategories = categories.filter(c => !cached.has(c.slug))
 
   // All categories cached with acceptable confidence: return immediately
@@ -289,7 +289,7 @@ export async function classifyText(
 
   let geminiResult: GeminiClassificationResult
   try {
-    geminiResult = await callGemini(env, prompt)
+    geminiResult = await callGemini(ctx, prompt)
   } catch (error) {
     // Gemini failed: serve whatever cache we have
     if (cached.size > 0) {
@@ -324,7 +324,7 @@ export async function classifyText(
 
   // --- DELIVER ---
   // Write valid results to cache (only entries matching known categories)
-  await writeCacheResults(env.DB, request.text, contexts, valid)
+  await writeCacheResults(db, request.text, contexts, valid)
 
   // Merge cached + fresh results
   const classifications: ClassificationItem[] = []

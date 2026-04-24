@@ -2,14 +2,65 @@
 
 export interface Env {
   DB: D1Database
+  HOBBOT_DB?: D1Database
   AI: Ai
   VECTORIZE: Vectorize
-  GEMINI_MODEL: string
   GEMINI_API_KEY: string
   AI_GATEWAY_ACCOUNT_ID: string
   AI_GATEWAY_NAME: string
   AI_GATEWAY_TOKEN?: string
+  PROVIDER_HEALTH?: KVNamespace
+  // Phase 8: Connectivity Agent work queue (event-driven, populated at atom confirmation)
+  CONNECTIVITY_KV: KVNamespace
   ALLOWED_ORIGINS: string
+  SERVICE_TOKENS?: string | { get: () => Promise<string> }
+  // R2 (daily review output)
+  R2?: R2Bucket
+  // R2 (grimoire bucket: reference images + analysis docs)
+  GRIMOIRE_R2?: R2Bucket
+  // DLQ alerting
+  DISCORD_WEBHOOK_URL?: string
+  // Queues
+  CLASSIFY_QUEUE: Queue<ClassifyMessage>
+  DISCOVERY_QUEUE: Queue<DiscoveryMessage>
+  VECTORIZE_QUEUE: Queue<VectorizeMessage>
+  ENRICH_QUEUE: Queue<EnrichMessage>
+  // Workflows
+  BULK_RETAG_WORKFLOW: Workflow
+  BULK_CORRESPONDENCES_WORKFLOW: Workflow
+}
+
+// --- Queue Message Types ---
+
+export type ClassifyMessage =
+  | { type: 'classify'; atomId: string }
+  | { type: 'enrich-harmonics'; atomId: string }
+  | { type: 'classify-register'; atomId: string; categorySlug: string }
+
+export type DiscoveryMessage = { type: 'discover'; atomId: string }
+
+export type VectorizeMessage =
+  | { type: 'vectorize'; atomId: string }
+  | { type: 'vectorize-chunk'; chunkId: string }
+
+export type EnrichMessage =
+  | { type: 'tag-arrangements'; atomId: string }
+  | { type: 'discover-correspondences'; atomId: string }
+
+export type QueueMessage = ClassifyMessage | DiscoveryMessage | VectorizeMessage | EnrichMessage
+
+// --- Workflow Params ---
+
+export interface BulkRetagParams {
+  batchSize?: number
+  afterRowid?: number
+  dryRun?: boolean
+}
+
+export interface BulkCorrespondenceParams {
+  batchSize?: number
+  afterRowid?: number
+  dryRun?: boolean
 }
 
 // --- Request/Response shapes ---
@@ -51,6 +102,18 @@ export interface CategoryRow {
   label: string
   description: string
   output_schema: string
+  default_modality: string
+}
+
+export interface CategoryMetadata {
+  slug: string
+  description: string
+  default_modality: string
+}
+
+export interface CategoryValidation {
+  slugs: Set<string>
+  modalityMap: Map<string, string>
 }
 
 export interface ContextRow {
@@ -159,10 +222,14 @@ export interface AtomRow {
   embedding_status: string // 'pending' | 'processing' | 'complete' | 'failed'
   // Modality axis
   modality: string // 'visual' | 'narrative' | 'both'
+  // Utility classification
+  utility: string // 'visual' | 'literary' | 'dual'
   // Phase 1.9: Tier
   tier: number // 1, 2, or 3
   // Phase 1.10: Register dimension
   register: number | null // 0.0 (ethereal) to 1.0 (visceral), NULL = unclassified
+  // Arrangement affiliation: [{slug, dist}] from top-N tagger
+  arrangement_tags: string // JSON array of {slug: string, dist: number}
 }
 
 export interface CreateAtomInput {
@@ -178,6 +245,7 @@ export interface CreateAtomInput {
   category_slug?: string | null
   harmonics?: string
   modality?: string
+  utility?: string
 }
 
 export interface UpdateAtomInput {
@@ -195,6 +263,8 @@ export interface BulkAtomResult {
   inserted: number
   duplicates: number
   errors: number
+  // Populated by bulkInsertAtoms so WithHooks wrapper can enqueue only confirmed rows.
+  inserted_ids?: Array<{ id: string; status: AtomStatus }>
 }
 
 export interface AtomListQuery {
@@ -205,6 +275,7 @@ export interface AtomListQuery {
   q?: string
   limit?: number
   offset?: number
+  after?: string
 }
 
 export interface AtomStats {
@@ -290,6 +361,15 @@ export interface SearchResult {
   score: number
 }
 
+export interface DocumentChunkSearchResult {
+  id: string
+  content: string
+  category_slug: string | null
+  document_id: string
+  document_title: string
+  similarity: number
+}
+
 // --- CSV Ingest ---
 
 export interface IngestCsvRequest {
@@ -346,4 +426,144 @@ export interface ExemplarRow {
   source_file: string | null
   metadata: string
   created_at: string
+}
+
+// --- Image Extraction ---
+
+export interface CandidateAtom {
+  name: string
+  description: string
+  suggested_category: string
+  utility: 'directive' | 'modifier' | 'descriptor'
+  modality: 'visual' | 'narrative' | 'both'
+  confidence: number
+}
+
+export interface CandidateCorrespondence {
+  source_name: string
+  target_name: string
+  relationship: string
+  suggested_strength: number
+}
+
+export interface ImageExtractionResult {
+  source_url: string
+  source_attribution: string
+  artist_attribution: string | null
+  candidate_atoms: CandidateAtom[]
+  candidate_correspondences: CandidateCorrespondence[]
+  raw_analysis: string
+}
+
+export interface ImageExtractionCandidate {
+  id: number
+  source_url: string
+  source_attribution: string | null
+  candidate_type: 'atom' | 'correspondence'
+  candidate_data: string
+  status: 'pending' | 'approved' | 'rejected' | 'merged'
+  review_notes: string | null
+  created_at: string
+  reviewed_at: string | null
+}
+
+// --- Vocabulary Resolution ---
+
+export interface ResolveRequest {
+  phrases: string[]
+  min_confidence?: number
+  include_harmonics?: boolean
+}
+
+export type ResolveMatchType = 'exact' | 'prefix' | 'semantic'
+
+export interface ResolvedAtom {
+  id: string
+  text: string
+  category_slug: string | null
+  match_type: ResolveMatchType
+  confidence: number
+  harmonics?: Record<string, number>
+}
+
+export interface ResolvedPhrase {
+  phrase: string
+  atoms: ResolvedAtom[]
+  unresolved_tokens: string[]
+}
+
+export interface ResolveResponse {
+  results: ResolvedPhrase[]
+  stats: {
+    total_phrases: number
+    fully_resolved: number
+    partially_resolved: number
+    unresolved: number
+  }
+}
+
+// --- Connectivity Agent (Phase 8) ---
+
+export interface ConnectivityStats {
+  source: 'event' | 'sweep'
+  atoms_processed: number
+  atoms_skipped: number
+  tags_applied: number
+  tags_ambiguous: number
+  memberships_created: number
+  memberships_ambiguous: number
+  correspondences_created: number
+  rows_read_estimate: number
+  rows_written: number
+  budget_exhausted: boolean
+  duration_ms: number
+  active_axes_count: number
+}
+
+export interface ConnectivityAxisCentroids {
+  v: 1
+  axis_slug: string
+  computed_at: string
+  seed_counts: { low: number; high: number }
+  insufficient?: boolean
+  low?: number[]
+  high?: number[]
+}
+
+export interface ConnectivityStatsRun {
+  at: string
+  source: 'event' | 'sweep'
+  atoms_processed: number
+  atoms_skipped: number
+  tags_applied: number
+  tags_ambiguous: number
+  memberships_created: number
+  memberships_ambiguous: number
+  correspondences_created: number
+  rows_read_estimate: number
+  rows_written: number
+  budget_exhausted: boolean
+  duration_ms: number
+  active_axes_count: number
+}
+
+export interface ConnectivityStatsDailyTotals {
+  atoms_processed: number
+  atoms_skipped: number
+  tags_applied: number
+  tags_ambiguous: number
+  memberships_created: number
+  memberships_ambiguous: number
+  correspondences_created: number
+  rows_read_estimate: number
+  rows_written: number
+  budget_exhausted_count: number
+  total_duration_ms: number
+}
+
+export interface ConnectivityStatsDaily {
+  v: 1
+  date: string
+  runs: ConnectivityStatsRun[]
+  totals: ConnectivityStatsDailyTotals
 }

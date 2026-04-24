@@ -1,4 +1,4 @@
-import type { CategoryRow, ContextRow, RelationRow, ResolvedCategory, ResolvedContext } from './types'
+import type { CategoryRow, CategoryMetadata, CategoryValidation, ContextRow, RelationRow, ResolvedCategory, ResolvedContext } from './types'
 
 /**
  * Resolve glob patterns to actual category rows from D1.
@@ -149,4 +149,26 @@ export async function getCategoryContexts(
 export async function getAllSlugs(db: D1Database): Promise<string[]> {
   const res = await db.prepare('SELECT slug FROM categories ORDER BY slug').all<{ slug: string }>()
   return res.results.map(r => r.slug)
+}
+
+/**
+ * Fetch category metadata for classification prompts and validation.
+ * Single D1 read returning slug, description, and default_modality.
+ */
+export async function getCategoryMetadata(db: D1Database): Promise<CategoryMetadata[]> {
+  const res = await db.prepare(
+    'SELECT slug, description, default_modality FROM categories ORDER BY slug'
+  ).all<CategoryMetadata>()
+  return res.results
+}
+
+/**
+ * Build a validation set from category metadata.
+ * Returns slug Set for O(1) membership checks and modality Map for fallback assignment.
+ */
+export function buildCategoryValidation(categories: CategoryMetadata[]): CategoryValidation {
+  return {
+    slugs: new Set(categories.map(r => r.slug)),
+    modalityMap: new Map(categories.map(r => [r.slug, r.default_modality])),
+  }
 }

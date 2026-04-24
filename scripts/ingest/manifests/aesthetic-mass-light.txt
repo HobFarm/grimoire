@@ -1,0 +1,62 @@
+# aesthetic-mass-light
+# Source: corpus query on narrative.mood + environment.atmosphere, weight<=0.2
+# Curator: d00d
+# Date: 2026-04-22
+# Axis: aesthetic-mass, Pole: low
+#
+# Terms describing low aesthetic mass as the primary reading:
+# airy, weightless, diffuse, ethereal, gaseous, sparse, translucent atmosphere.
+
+aether
+afterglow
+airy atmosphere
+alpenglow
+auroras
+bubbles
+clouds
+darkness of space
+diaphanous
+diffuse
+dreamlike
+dust
+ephemeral
+ethereal
+ethereal atmosphere
+floating bubbles
+fog
+foggy conditions
+foggy light
+gas texture
+gauzy
+gossamer
+hazy
+inky darkness
+luminous
+luminous, radiating energy fields
+mist
+misty
+misty woods
+moonlit sky
+nebulas
+northern lights
+plasma texture
+pollen
+powder
+serene
+shimmering
+smoke
+smoke texture
+snow
+snowy light
+sparkling stars
+starfields
+swirling nebulae
+translucent
+tranquil
+vaporous
+vapour
+weightless
+whispering
+white clouds
+wispy
+wispy clouds

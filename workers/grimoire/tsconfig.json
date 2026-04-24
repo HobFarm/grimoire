@@ -10,7 +10,8 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "isolatedModules": true
+    "isolatedModules": true,
+    "paths": { "@shared/*": ["../../HobBot/src/*"] }
   },
   "include": ["src/**/*.ts"]
 }

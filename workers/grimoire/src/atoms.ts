@@ -1,11 +1,14 @@
 import type {
   AtomRow,
+  AtomStatus,
   CreateAtomInput,
   UpdateAtomInput,
   BulkAtomResult,
   AtomListQuery,
   AtomStats,
+  Env,
 } from './types'
+import { enqueueForConnectivity, enqueueForConnectivityBatch } from './connectivity'
 
 const CONFIRMATION_THRESHOLD = 3
 
@@ -34,8 +37,8 @@ export async function createAtom(db: D1Database, input: CreateAtomInput): Promis
 
   await db
     .prepare(
-      `INSERT INTO atoms (id, text, text_lower, collection_slug, observation, status, confidence, encounter_count, tags, source, source_app, metadata, created_at, updated_at, category_slug, harmonics, modality)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO atoms (id, text, text_lower, collection_slug, observation, status, confidence, encounter_count, tags, source, source_app, metadata, created_at, updated_at, category_slug, harmonics, modality, utility)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -54,6 +57,7 @@ export async function createAtom(db: D1Database, input: CreateAtomInput): Promis
       input.category_slug ?? null,
       input.harmonics ?? '{}',
       input.modality ?? 'visual',
+      input.utility ?? 'visual',
     )
     .run()
 
@@ -128,7 +132,7 @@ export async function deleteAtom(db: D1Database, id: string): Promise<boolean> {
 export async function listAtoms(
   db: D1Database,
   query: AtomListQuery
-): Promise<{ atoms: AtomRow[]; total: number }> {
+): Promise<{ atoms: AtomRow[]; total: number; next_cursor: string | null; sort: string }> {
   const conditions: string[] = []
   const params: unknown[] = []
 
@@ -153,28 +157,50 @@ export async function listAtoms(
     params.push(query.q.toLowerCase().trim())
   }
 
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
   const limit = Math.min(query.limit ?? 50, 500)
-  const offset = query.offset ?? 0
+  const useCursor = !!query.after
+
+  if (useCursor) {
+    // Cursor-based: O(1) for any page depth via id index
+    conditions.push('id > ?')
+    params.push(query.after!)
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
 
   const countRes = await db
     .prepare(`SELECT COUNT(*) as total FROM atoms ${where}`)
     .bind(...params)
     .first<{ total: number }>()
 
+  const orderClause = useCursor ? 'ORDER BY id ASC' : 'ORDER BY created_at DESC'
+  const limitClause = useCursor ? 'LIMIT ?' : 'LIMIT ? OFFSET ?'
+  const limitParams = useCursor ? [limit] : [limit, query.offset ?? 0]
+
   const res = await db
-    .prepare(`SELECT * FROM atoms ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
-    .bind(...params, limit, offset)
+    .prepare(`SELECT * FROM atoms ${where} ${orderClause} ${limitClause}`)
+    .bind(...params, ...limitParams)
     .all<AtomRow>()
 
-  return { atoms: res.results, total: countRes?.total ?? 0 }
+  const atoms = res.results
+  const next_cursor = atoms.length >= limit ? atoms[atoms.length - 1].id : null
+
+  return {
+    atoms,
+    total: countRes?.total ?? 0,
+    next_cursor,
+    sort: useCursor ? 'id_asc' : 'created_at_desc',
+  }
 }
 
 // --- Encounter Lifecycle ---
 
-export async function encounterAtom(db: D1Database, id: string): Promise<AtomRow | null> {
+export async function encounterAtom(
+  db: D1Database,
+  id: string,
+): Promise<{ atom: AtomRow | null; confirmed_now: boolean }> {
   const existing = await getAtom(db, id)
-  if (!existing) return null
+  if (!existing) return { atom: null, confirmed_now: false }
 
   const now = new Date().toISOString()
   const newCount = existing.encounter_count + 1
@@ -197,7 +223,8 @@ export async function encounterAtom(db: D1Database, id: string): Promise<AtomRow
       .run()
   }
 
-  return getAtom(db, id)
+  const atom = await getAtom(db, id)
+  return { atom, confirmed_now: shouldConfirm }
 }
 
 export async function listAtomsForReview(
@@ -228,18 +255,22 @@ export async function bulkInsertAtoms(
   let inserted = 0
   let duplicates = 0
   let errors = 0
+  const inserted_ids: Array<{ id: string; status: AtomStatus }> = []
 
   // Process in chunks of 100
   for (let i = 0; i < inputs.length; i += 100) {
     const chunk = inputs.slice(i, i + 100)
     const statements: D1PreparedStatement[] = []
+    const chunkMeta: Array<{ id: string; status: AtomStatus }> = []
 
     for (const input of chunk) {
       const id = generateId()
       const textLower = input.text.toLowerCase().trim()
       const now = new Date().toISOString()
-      const status = input.status ?? (input.source === 'ai' ? 'provisional' : 'confirmed')
+      const status: AtomStatus = input.status ?? (input.source === 'ai' ? 'provisional' : 'confirmed')
       const confidence = input.confidence ?? (input.source === 'ai' ? 0.5 : 1.0)
+
+      chunkMeta.push({ id, status })
 
       statements.push(
         db
@@ -267,19 +298,20 @@ export async function bulkInsertAtoms(
 
     try {
       const results = await db.batch(statements)
-      for (const r of results) {
+      results.forEach((r, idx) => {
         if ((r.meta.changes ?? 0) > 0) {
           inserted++
+          inserted_ids.push(chunkMeta[idx])
         } else {
           duplicates++
         }
-      }
+      })
     } catch {
       errors += chunk.length
     }
   }
 
-  return { inserted, duplicates, errors }
+  return { inserted, duplicates, errors, inserted_ids }
 }
 
 // --- Stats ---
@@ -346,4 +378,45 @@ export async function findAtomByText(
     .prepare('SELECT * FROM atoms WHERE text_lower = ?')
     .bind(textLower)
     .first<AtomRow>()
+}
+
+// --- Connectivity hook wrappers ---
+// These wrap the pure functions above. HTTP handlers should call these so that
+// confirmed atoms get enqueued for Phase 8 connectivity scoring. Pure variants
+// are kept unchanged for tests, migrations, and internal callers.
+
+export async function createAtomWithHooks(
+  env: Env,
+  input: CreateAtomInput,
+): Promise<AtomRow> {
+  const atom = await createAtom(env.DB, input)
+  if (atom.status === 'confirmed' && env.CONNECTIVITY_KV) {
+    enqueueForConnectivity(env.CONNECTIVITY_KV, atom.id).catch(() => {})
+  }
+  return atom
+}
+
+export async function encounterAtomWithHooks(
+  env: Env,
+  id: string,
+): Promise<AtomRow | null> {
+  const { atom, confirmed_now } = await encounterAtom(env.DB, id)
+  if (confirmed_now && env.CONNECTIVITY_KV) {
+    enqueueForConnectivity(env.CONNECTIVITY_KV, id).catch(() => {})
+  }
+  return atom
+}
+
+export async function bulkInsertAtomsWithHooks(
+  env: Env,
+  inputs: CreateAtomInput[],
+): Promise<BulkAtomResult> {
+  const result = await bulkInsertAtoms(env.DB, inputs)
+  const confirmedIds = (result.inserted_ids ?? [])
+    .filter(x => x.status === 'confirmed')
+    .map(x => x.id)
+  if (confirmedIds.length > 0 && env.CONNECTIVITY_KV) {
+    enqueueForConnectivityBatch(env.CONNECTIVITY_KV, confirmedIds).catch(() => {})
+  }
+  return result
 }

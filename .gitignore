@@ -1,5 +1,7 @@
 # Environment & secrets
 .env
+.env.local
+env.local
 .dev.vars
 .dev.vars.*
 
@@ -33,3 +35,18 @@ _notes/
 
 # HobBot is its own repo
 HobBot/
+
+# Local CDN mirror (large)
+cdn/
+
+# Wildcard source dumps (large)
+wildcards/
+
+# Script output / scratch logs
+scripts/output/
+
+# Scratch previews and audit dumps at repo root
+/*.txt
+/audit-*.*
+/cc-brief-*.md
+/aesthetic-mass-*.*

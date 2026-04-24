@@ -4,6 +4,7 @@ import {
   isOppositionalInContext,
   getProviderWarnings,
 } from './state/relations'
+import { rerankCandidates } from './reranker'
 
 // --- Types ---
 
@@ -43,11 +44,11 @@ interface InvokeResponse {
 }
 
 interface HarmonicProfile {
-  hardness: string
-  temperature: string
-  weight: string
-  formality: string
-  era_affinity: string
+  hardness: number
+  temperature: number
+  weight: number
+  formality: number
+  era_affinity: number
   register?: number  // 0.0-1.0, null/undefined coalesces to 0.5
 }
 
@@ -77,15 +78,9 @@ export class InvokeError extends Error {
 
 // --- Constants ---
 
+// Embedding model sourced from models.ts via vectorize.ts; duplicated here
+// for invoke-time embedding. TODO: share via import when invoke refactored.
 const EMBEDDING_MODEL = '@cf/baai/bge-base-en-v1.5' as const
-
-const DIMENSION_VECTORS: Record<string, Record<string, number[]>> = {
-  hardness:     { hard: [1, 0], soft: [0, 1], neutral: [0.5, 0.5] },
-  temperature:  { warm: [1, 0], cool: [0, 1], neutral: [0.5, 0.5] },
-  weight:       { heavy: [1, 0], light: [0, 1], neutral: [0.5, 0.5] },
-  formality:    { structured: [1, 0], organic: [0, 1], neutral: [0.5, 0.5] },
-  era_affinity: { archaic: [1, 0, 0, 0], industrial: [0, 1, 0, 0], modern: [0, 0, 1, 0], timeless: [0, 0, 0, 1] },
-}
 
 const TIER_WEIGHT: Record<number, number> = { 1: 1.0, 2: 0.6, 3: 0.2 }
 const RANDOM_FLOOR = 0.05
@@ -98,52 +93,37 @@ const WEIGHTS_NO_ARRANGEMENT: ScoringWeights = {
   exemplar: 0.40, correspondence: 0.30, harmonic: 0.00, tier: 0.20, semantic: 0.10,
 }
 
-// --- Harmonic Similarity (ported from conductor.ts) ---
+// --- Harmonic Similarity (numeric distance, matches arrangement-tagger.ts) ---
 
 function harmonicSimilarity(a: HarmonicProfile, b: HarmonicProfile): number {
-  const categoricalDims: (keyof HarmonicProfile)[] = [
+  const dims: (keyof HarmonicProfile)[] = [
     'hardness', 'temperature', 'weight', 'formality', 'era_affinity',
   ]
   let totalSim = 0
-  for (const dim of categoricalDims) {
-    const vecA = DIMENSION_VECTORS[dim][a[dim] as string] || DIMENSION_VECTORS[dim]['neutral']
-    const vecB = DIMENSION_VECTORS[dim][b[dim] as string] || DIMENSION_VECTORS[dim]['neutral']
-    let dot = 0, magA = 0, magB = 0
-    for (let i = 0; i < vecA.length; i++) {
-      dot += vecA[i] * vecB[i]
-      magA += vecA[i] * vecA[i]
-      magB += vecB[i] * vecB[i]
-    }
-    totalSim += (magA > 0 && magB > 0) ? dot / (Math.sqrt(magA) * Math.sqrt(magB)) : 0
+  for (const dim of dims) {
+    const va = (a[dim] as number) ?? 0.5
+    const vb = (b[dim] as number) ?? 0.5
+    totalSim += 1 - Math.abs(va - vb)  // 1.0 = identical, 0.0 = opposite
   }
-
-  // Register dimension: continuous 0.0-1.0, coalesce null/undefined to 0.5
   const regA = a.register ?? 0.5
   const regB = b.register ?? 0.5
-  const rVecA = [regA, 1 - regA]
-  const rVecB = [regB, 1 - regB]
-  const rDot = rVecA[0] * rVecB[0] + rVecA[1] * rVecB[1]
-  const rMagA = Math.sqrt(rVecA[0] * rVecA[0] + rVecA[1] * rVecA[1])
-  const rMagB = Math.sqrt(rVecB[0] * rVecB[0] + rVecB[1] * rVecB[1])
-  const regSim = (rMagA > 0 && rMagB > 0) ? rDot / (rMagA * rMagB) : 0
-  totalSim += regSim
-
-  return totalSim / 6  // 5 categorical + 1 register
+  totalSim += 1 - Math.abs(regA - regB)
+  return totalSim / 6  // 5 harmonic + 1 register
 }
 
 function safeParseHarmonics(json: string, register?: number | null): HarmonicProfile {
   try {
     const h = JSON.parse(json)
     return {
-      hardness: h.hardness || 'neutral',
-      temperature: h.temperature || 'neutral',
-      weight: h.weight || 'neutral',
-      formality: h.formality || 'neutral',
-      era_affinity: h.era_affinity || 'timeless',
+      hardness: typeof h.hardness === 'number' ? h.hardness : 0.5,
+      temperature: typeof h.temperature === 'number' ? h.temperature : 0.5,
+      weight: typeof h.weight === 'number' ? h.weight : 0.5,
+      formality: typeof h.formality === 'number' ? h.formality : 0.5,
+      era_affinity: typeof h.era_affinity === 'number' ? h.era_affinity : 0.5,
       register: register ?? 0.5,
     }
   } catch {
-    return { hardness: 'neutral', temperature: 'neutral', weight: 'neutral', formality: 'neutral', era_affinity: 'timeless', register: register ?? 0.5 }
+    return { hardness: 0.5, temperature: 0.5, weight: 0.5, formality: 0.5, era_affinity: 0.5, register: register ?? 0.5 }
   }
 }
 
@@ -204,12 +184,26 @@ async function loadMetadata(
   }
 
   let arrangement: ArrangementRow | null = null
+  const contextModeMap = new Map<string, { guidance: string; mode: string }>()
   if (arrangementSlug) {
     arrangement = (results[3].results as unknown as ArrangementRow[])[0] || null
     if (!arrangement) throw new InvokeError(`Arrangement "${arrangementSlug}" not found`, 404)
+
+    // Load category_contexts for this arrangement (context_mode: enrich, replace, translate)
+    if (arrangement.context_key) {
+      const { results: ctxRows } = await db.prepare(
+        'SELECT category_slug, guidance, context_mode FROM category_contexts WHERE context = ?'
+      ).bind(arrangement.context_key).all<{ category_slug: string; guidance: string; context_mode: string | null }>()
+      for (const row of ctxRows) {
+        contextModeMap.set(row.category_slug, {
+          guidance: row.guidance,
+          mode: row.context_mode || 'enrich',
+        })
+      }
+    }
   }
 
-  return { incantation, slots, exemplarMap, maxFreqPerSlot, arrangement }
+  return { incantation, slots, exemplarMap, maxFreqPerSlot, arrangement, contextModeMap }
 }
 
 async function resolveSeeds(
@@ -393,7 +387,7 @@ export async function invoke(env: Env, request: InvokeRequest): Promise<InvokeRe
   let oppositionalFilters = 0
 
   // 1. Load metadata
-  const { incantation, slots, exemplarMap, maxFreqPerSlot, arrangement } = await loadMetadata(
+  const { incantation, slots, exemplarMap, maxFreqPerSlot, arrangement, contextModeMap } = await loadMetadata(
     db, request.incantation, request.arrangement,
   )
 
@@ -460,6 +454,22 @@ export async function invoke(env: Env, request: InvokeRequest): Promise<InvokeRe
     }
   }
 
+  // 6b. If intent exists, run reranker for higher-quality semantic scoring
+  let rerankerScores: Map<string, number> | null = null
+  if (hasIntent) {
+    const allCandidates: Array<{ id: string; text: string }> = []
+    for (const pool of candidatePools.values()) {
+      for (const atom of pool) {
+        allCandidates.push({ id: atom.id, text: atom.text })
+      }
+    }
+    if (allCandidates.length > 0) {
+      // Cap at 200 candidates to stay within model limits
+      const capped = allCandidates.slice(0, 200)
+      rerankerScores = await rerankCandidates(env.AI, request.intent!, capped)
+    }
+  }
+
   // 7. Determine fill order: seeded first, then by category weight desc, sort_order asc
   const orderedSlots = [...slots].sort((a, b) => {
     const aSeeded = seededSlotNames.has(a.slot_name) ? 0 : 1
@@ -493,8 +503,27 @@ export async function invoke(env: Env, request: InvokeRequest): Promise<InvokeRe
       continue
     }
 
-    // Non-seeded: score candidates
-    const pool = candidatePools.get(slot.category_filter || '') || []
+    // Non-seeded: check context_mode before scoring
+    const slotCategory = slot.category_filter || ''
+    const contextEntry = contextModeMap.get(slotCategory)
+
+    if (contextEntry?.mode === 'replace' && contextEntry.guidance) {
+      // Replace mode: skip exemplar lookup, use guidance text directly as slot content
+      slotResults.push({
+        slot_name: slot.slot_name,
+        selected: { text: contextEntry.guidance, atom_id: '__context_guidance__', score: 1.0 },
+        alternatives: [],
+        opposition_warnings: [],
+      })
+      continue
+    }
+
+    if (contextEntry?.mode === 'translate') {
+      console.log(`[invoke] translate mode not yet implemented for ${arrangement?.slug}:${slotCategory}, falling back to enrich`)
+    }
+
+    // Enrich mode (default): score candidates from atom pool
+    const pool = candidatePools.get(slotCategory) || []
     const available = pool.filter(a => !selectedAtomIds.has(a.id))
 
     if (available.length === 0) {
@@ -520,7 +549,8 @@ export async function invoke(env: Env, request: InvokeRequest): Promise<InvokeRe
         ? harmonicSimilarity(atom.harmonics, arrangementHarmonics)
         : 0
       const tierScore = TIER_WEIGHT[atom.tier] ?? 0.2
-      const semanticScore = intentScores?.get(atom.id) || 0
+      // Prefer reranker (cross-encoder) over Vectorize (bi-encoder) when available
+      const semanticScore = rerankerScores?.get(atom.id) ?? intentScores?.get(atom.id) ?? 0
 
       return {
         ...atom,

@@ -4,12 +4,34 @@ compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-AI_GATEWAY_URL = "https://gateway.ai.cloudflare.com/v1/e343cbfa70c5166f00d871e513ae352a/hobfarm"
+AI_GATEWAY_ACCOUNT_ID = "e343cbfa70c5166f00d871e513ae352a"
+AI_GATEWAY_NAME = "hobfarm"
 
 [[d1_databases]]
 binding = "GRIMOIRE_DB"
 database_name = "grimoire-db"
 database_id = "3cb1cdee-17af-477c-ab0a-5a18447948ef"
 
-# Set GEMINI_API_KEY as a secret:
-# wrangler secret put GEMINI_API_KEY
+[[d1_databases]]
+binding = "HOBBOT_DB"
+database_name = "hobbot-db"
+database_id = "d91a32f8-670b-46a3-9008-f16224b2f8d7"
+
+[ai]
+binding = "AI"
+
+[[kv_namespaces]]
+binding = "PROVIDER_HEALTH"
+id = "30a7b9ccfd82493b9c96fbe994b40bbe"
+preview_id = "85429dee6bca4fb58ad8e032510cc7b0"
+
+# Secrets Store
+[[secrets_store_secrets]]
+binding = "GEMINI_API_KEY"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "gemini-api-key"
+
+[[secrets_store_secrets]]
+binding = "AI_GATEWAY_TOKEN"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "ai-gateway-token"

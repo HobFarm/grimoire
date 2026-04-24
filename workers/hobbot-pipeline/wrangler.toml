@@ -34,15 +34,29 @@ binding = "GRIMOIRE"
 service = "grimoire"
 
 [vars]
-ENVIRONMENT = "development"
+ENVIRONMENT = "production"
 STYLEFUSION_URL = "https://sf.hob.farm"
 SELF_URL = "https://hobbot-pipeline.damp-violet-bf89.workers.dev"
-INTERNAL_SECRET = "enrich-chain-2026"
 
 [[secrets_store_secrets]]
 binding = "GEMINI_API_KEY"
 store_id = "e1efb254fa9e40359b0b3bdeab02b082"
 secret_name = "gemini-api-key"
+
+[[secrets_store_secrets]]
+binding = "SERVICE_TOKENS"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "service-tokens"
+
+[[secrets_store_secrets]]
+binding = "INTERNAL_SECRET"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "pipeline-internal-secret"
+
+[[secrets_store_secrets]]
+binding = "GITHUB_TOKEN"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "github-token"
 
 [observability]
 enabled = false

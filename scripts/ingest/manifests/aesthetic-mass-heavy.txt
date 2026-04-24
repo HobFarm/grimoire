@@ -1,0 +1,84 @@
+# aesthetic-mass-heavy
+# Source: corpus query on narrative.mood + environment.atmosphere, weight>=0.8
+# Curator: d00d
+# Date: 2026-04-22
+# Axis: aesthetic-mass, Pole: high
+#
+# Terms describing high aesthetic mass as the primary reading:
+# dense, oppressive, substantial, charged, weighted, grave, crushing atmosphere.
+
+abject
+abrasive
+absolute zero
+abyss energy
+abyssal eclipse
+acid rain
+acid rain storms
+adamant
+aggressive
+agonizing
+alarming
+ancestral energy
+anchored
+ancient
+angst
+angular
+annihilating
+antimatter tornadoes
+antique grunge
+anxiety
+apocalyptic
+appalling
+arcane
+arctic temperature
+arresting
+ash storm
+atrocious
+austere
+blighted
+bleak
+brooding
+brutal
+charged
+crushing
+dark
+dense
+desolate
+dire
+dread
+foreboding
+funereal
+grave
+grim
+gritty
+haunted
+heavy
+hostile
+industrial
+leaden
+looming
+massive
+menacing
+monolithic
+monumental
+oppressive
+ominous
+overbearing
+ponderous
+relentless
+savage
+severe
+solemn
+sombre
+stark
+stormy
+suffocating
+thunderous
+thick
+threatening
+tempestuous
+tormented
+towering
+treacherous
+turbulent
+weighted

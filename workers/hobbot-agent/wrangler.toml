@@ -1,0 +1,80 @@
+name = "hobbot-agent"
+main = "src/server.ts"
+compatibility_date = "2026-03-05"
+compatibility_flags = ["nodejs_compat"]
+
+[ai]
+binding = "AI"
+
+[observability]
+enabled = true
+
+[[durable_objects.bindings]]
+name = "HOBBOT"
+class_name = "HobBotAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HobBotAgent"]
+
+[[kv_namespaces]]
+binding = "PROVIDER_HEALTH"
+id = "30a7b9ccfd82493b9c96fbe994b40bbe"
+
+[[r2_buckets]]
+binding = "CDN"
+bucket_name = "hobfarm-cdn"
+
+[[d1_databases]]
+binding = "HOBBOT_DB"
+database_name = "hobbot-db"
+database_id = "d91a32f8-670b-46a3-9008-f16224b2f8d7"
+
+[[services]]
+binding = "GRIMOIRE"
+service = "grimoire"
+
+[vars]
+ACCOUNT_ID = "e343cbfa70c5166f00d871e513ae352a"
+GATEWAY_NAME = "hobfarm"
+
+# Secrets Store
+[[secrets_store_secrets]]
+binding = "ANTHROPIC_API_KEY"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "anthropic-api-key"
+
+[[secrets_store_secrets]]
+binding = "XAI_API_KEY"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "grok-api-key"
+
+[[secrets_store_secrets]]
+binding = "GEMINI_API_KEY"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "gemini-api-key"
+
+[[secrets_store_secrets]]
+binding = "AI_GATEWAY_TOKEN"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "ai-gateway-token"
+
+[[secrets_store_secrets]]
+binding = "X_CONSUMER_KEY"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "x-consumer-key"
+
+[[secrets_store_secrets]]
+binding = "X_CONSUMER_SECRET"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "x-consumer-secret"
+
+[[secrets_store_secrets]]
+binding = "X_ACCESS_TOKEN"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "x-access-token"
+
+[[secrets_store_secrets]]
+binding = "X_ACCESS_SECRET"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "x-access-token-secret"

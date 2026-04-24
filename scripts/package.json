@@ -1,0 +1,9 @@
+{
+  "name": "grimoire-scripts",
+  "type": "module",
+  "private": true,
+  "description": "Grimoire ingestion scripts. Pure Node builtins by default; sharp is optional for moodboard compositing.",
+  "dependencies": {
+    "sharp": "^0.33.5"
+  }
+}

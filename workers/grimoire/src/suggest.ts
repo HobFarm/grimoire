@@ -1,19 +1,23 @@
-import type { Env, AtomRow, AtomObservation, DiscoverResponse, DiscoverRejection, DecomposeResponse } from './types'
-import { VALID_CATEGORIES, VALID_HARMONICS, HARMONIC_DEFAULTS, VALID_MODALITIES, CATEGORY_MODALITY } from './constants'
-import { fetchGeminiText, tryParseJson } from './gemini'
+import type { AtomRow, AtomObservation, DiscoverResponse, DiscoverRejection, DecomposeResponse, CategoryMetadata } from './types'
+import { HARMONIC_DIMENSIONS, HARMONIC_DEFAULTS, VALID_MODALITIES, VALID_UTILITIES } from './constants'
+import { tryParseJson } from './gemini'
 import { findAtomByText, encounterAtom, createAtom } from './atoms'
-import { CLASSIFICATION_PROMPT } from './atom-classify'
+import { buildClassificationPrompt } from './atom-classify'
 import { collectionFromCategory, isGenericTerm } from './taxonomy'
+import { type ModelContext } from './models'
+import { callWithFallback } from './provider'
+import { getCategoryMetadata, buildCategoryValidation } from './db'
 
 // --- Discover ---
 
 interface GeminiDiscoverSuccess {
   cat: string
   mod: string
+  util: string
   obs: string
   confidence: number
   reasoning: string
-  h: Record<string, string>
+  h: Record<string, number>
 }
 
 interface GeminiDiscoverRejection {
@@ -36,14 +40,15 @@ function validateDiscoverShape(parsed: unknown): GeminiDiscoverResult | null {
   if (typeof obj.cat !== 'string') return null
   if (typeof obj.confidence !== 'number') return null
   const mod = typeof obj.mod === 'string' ? obj.mod : 'visual'
+  const util = typeof obj.util === 'string' ? obj.util : 'visual'
   const obs = obj.obs === 'interpretation' ? 'interpretation' : 'observation'
   const reasoning = typeof obj.reasoning === 'string' ? obj.reasoning : ''
-  const h = (obj.h && typeof obj.h === 'object') ? obj.h as Record<string, string> : {}
-  return { cat: obj.cat, mod, obs, confidence: obj.confidence, reasoning, h }
+  const h = (obj.h && typeof obj.h === 'object') ? obj.h as Record<string, number> : {}
+  return { cat: obj.cat, mod, util, obs, confidence: obj.confidence, reasoning, h }
 }
 
-function buildDiscoverPrompt(text: string): string {
-  return CLASSIFICATION_PROMPT + `
+function buildDiscoverPrompt(text: string, classificationPrompt: string): string {
+  return classificationPrompt + `
 
 If the term is a single generic adjective with no specific visual meaning
 (e.g. "prominent", "beautiful", "large", "nice"), respond with {"rejected":true}.
@@ -52,11 +57,12 @@ Classify this new term:
 - text: "${text}"
 
 Respond with ONLY a JSON object:
-{"cat":"category_slug","mod":"visual|narrative|both","obs":"observation|interpretation","confidence":0.0,"reasoning":"brief explanation","h":{"hardness":"...","temperature":"...","weight":"...","formality":"...","era_affinity":"..."}}`
+{"cat":"category_slug","mod":"visual|narrative|both","util":"visual","obs":"observation|interpretation","confidence":0.0,"reasoning":"brief explanation","h":{"hardness":0.0,"temperature":0.0,"weight":0.0,"formality":0.0,"era_affinity":0.0}}`
 }
 
 export async function discoverAtom(
-  env: Env,
+  db: D1Database,
+  ctx: ModelContext,
   text: string,
   sourceApp?: string
 ): Promise<DiscoverResponse | DiscoverRejection> {
@@ -66,9 +72,9 @@ export async function discoverAtom(
   }
 
   // Check for existing atom
-  const existing = await findAtomByText(env.DB, text)
+  const existing = await findAtomByText(db, text)
   if (existing) {
-    const updated = await encounterAtom(env.DB, existing.id)
+    const { atom: updated } = await encounterAtom(db, existing.id)
     const atom = updated ?? existing
     return {
       atom,
@@ -82,11 +88,15 @@ export async function discoverAtom(
     }
   }
 
-  // New term: classify with Gemini (category + harmonics + modality in one call)
-  const prompt = buildDiscoverPrompt(text)
-  const model = env.GEMINI_MODEL || 'gemini-2.5-flash'
+  // Fetch categories from DB for prompt and validation
+  const categories = await getCategoryMetadata(db)
+  const validation = buildCategoryValidation(categories)
+  const classificationPrompt = buildClassificationPrompt(categories)
 
-  const rawText = await fetchGeminiText(env, model, prompt, 0.3)
+  // New term: classify (category + harmonics + modality in one call)
+  const prompt = buildDiscoverPrompt(text, classificationPrompt)
+
+  const { result: rawText } = await callWithFallback(ctx, 'discover', prompt)
   let result = tryParseJson<GeminiDiscoverResult>(rawText, validateDiscoverShape)
 
   // Retry once on parse failure
@@ -94,12 +104,12 @@ export async function discoverAtom(
     const stricterPrompt =
       prompt +
       '\n\nIMPORTANT: Respond with a JSON object only. No markdown, no explanation, no code fences. The response must be parseable by JSON.parse().'
-    const retryText = await fetchGeminiText(env, model, stricterPrompt, 0.3)
+    const { result: retryText } = await callWithFallback(ctx, 'discover', stricterPrompt)
     result = tryParseJson<GeminiDiscoverResult>(retryText, validateDiscoverShape)
   }
 
   if (!result) {
-    throw new Error('Gemini returned unparseable classification after retry')
+    throw new Error('Provider returned unparseable classification after retry')
   }
 
   // Handle Gemini rejection
@@ -107,37 +117,40 @@ export async function discoverAtom(
     return { rejected: true, term: text, reason: 'gemini_rejected' }
   }
 
-  // Validate category_slug
-  if (!(VALID_CATEGORIES as readonly string[]).includes(result.cat)) {
+  // Validate category_slug against DB set
+  if (!validation.slugs.has(result.cat)) {
     console.log(`[discover] Unknown category_slug from Gemini: "${result.cat}" for term "${text}"`)
   }
 
   // Derive collection_slug from canonical lookup
   const collection_slug = collectionFromCategory(result.cat)
 
-  // Validate modality
+  // Validate modality: explicit from model, then fallback to DB default
   let modality = 'visual'
   if ((VALID_MODALITIES as readonly string[]).includes(result.mod)) {
     modality = result.mod
-  } else if (result.cat in CATEGORY_MODALITY) {
-    modality = CATEGORY_MODALITY[result.cat]
+  } else {
+    modality = validation.modalityMap.get(result.cat) ?? 'both'
   }
 
   // Validate and normalize harmonics
-  const harmonics: Record<string, string> = {}
-  for (const [dim, validValues] of Object.entries(VALID_HARMONICS)) {
-    const val = result.h[dim]
-    if (typeof val === 'string' && (validValues as readonly string[]).includes(val)) {
-      harmonics[dim] = val
+  const harmonics: Record<string, number> = {}
+  for (const dim of HARMONIC_DIMENSIONS) {
+    const val = Number(result.h[dim])
+    if (!isNaN(val)) {
+      harmonics[dim] = Math.round(Math.min(1.0, Math.max(0.0, val)) * 100) / 100
     } else {
       harmonics[dim] = HARMONIC_DEFAULTS[dim]
     }
   }
 
+  const utility = (VALID_UTILITIES as readonly string[]).includes(result.util as any)
+    ? result.util : 'visual'
+
   const observation: AtomObservation = result.obs === 'interpretation' ? 'interpretation' : 'observation'
 
-  // Write new atom with full enrichment (category, harmonics, modality)
-  const atom = await createAtom(env.DB, {
+  // Write new atom with full enrichment (category, harmonics, modality, utility)
+  const atom = await createAtom(db, {
     text,
     collection_slug,
     observation,
@@ -148,6 +161,7 @@ export async function discoverAtom(
     category_slug: result.cat,
     harmonics: JSON.stringify(harmonics),
     modality,
+    utility,
   })
 
   return {
@@ -191,8 +205,8 @@ function validateDecomposeShape(parsed: unknown): GeminiDecomposeResult | null {
   }
 }
 
-function buildDecomposePrompt(concept: string): string {
-  const categoryList = (VALID_CATEGORIES as readonly string[]).join(', ')
+function buildDecomposePrompt(concept: string, categories: CategoryMetadata[]): string {
+  const categoryList = categories.map(c => c.slug).join(', ')
 
   return `You are a visual vocabulary decomposer for an AI image generation system.
 
@@ -227,21 +241,25 @@ Generate 5-15 atoms. Prefer specific visual terms over generic ones. If the conc
 }
 
 export async function decomposeAtom(
-  env: Env,
+  db: D1Database,
+  ctx: ModelContext,
   concept: string,
   sourceApp?: string
 ): Promise<DecomposeResponse> {
-  const prompt = buildDecomposePrompt(concept)
-  const model = env.GEMINI_MODEL || 'gemini-2.5-flash'
+  // Fetch categories from DB for prompt and validation
+  const categories = await getCategoryMetadata(db)
+  const validCats = new Set(categories.map(c => c.slug))
 
-  const rawText = await fetchGeminiText(env, model, prompt, 0.4)
+  const prompt = buildDecomposePrompt(concept, categories)
+
+  const { result: rawText } = await callWithFallback(ctx, 'decompose', prompt)
   let result = tryParseJson<GeminiDecomposeResult>(rawText, validateDecomposeShape)
 
   if (!result) {
     const stricterPrompt =
       prompt +
       '\n\nIMPORTANT: Respond with a JSON object only. No markdown, no explanation, no code fences. The response must be parseable by JSON.parse().'
-    const retryText = await fetchGeminiText(env, model, stricterPrompt, 0.4)
+    const { result: retryText } = await callWithFallback(ctx, 'decompose', stricterPrompt)
     result = tryParseJson<GeminiDecomposeResult>(retryText, validateDecomposeShape)
   }
 
@@ -249,7 +267,6 @@ export async function decomposeAtom(
     throw new Error('Gemini returned unparseable decomposition after retry')
   }
 
-  const validCats = new Set(VALID_CATEGORIES as readonly string[])
   const unknownCategories = new Set(result.missing_categories)
   const atomsCreated: AtomRow[] = []
   const atomsExisting: AtomRow[] = []
@@ -265,16 +282,16 @@ export async function decomposeAtom(
     const collection_slug = collectionFromCategory(rawAtom.category_slug)
 
     // Check for existing atom
-    const existing = await findAtomByText(env.DB, rawAtom.text)
+    const existing = await findAtomByText(db, rawAtom.text)
     if (existing) {
-      const updated = await encounterAtom(env.DB, existing.id)
+      const { atom: updated } = await encounterAtom(db, existing.id)
       atomsExisting.push(updated ?? existing)
       continue
     }
 
     // Create new atom
     try {
-      const atom = await createAtom(env.DB, {
+      const atom = await createAtom(db, {
         text: rawAtom.text.trim(),
         collection_slug,
         observation: rawAtom.observation,

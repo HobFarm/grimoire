@@ -1,0 +1,35 @@
+# body-mass-heavy
+# Source: body-heavy.txt + adj-general.txt body adjectives + skin_body.txt heavy-type
+# Curator: d00d
+# Date: 2026-04-21
+# Axis: body-mass, Pole: high
+#
+# Terms describing high body mass as the primary reading.
+# Muscle-dominant terms (muscular, brawny, beefy, hulking) excluded - belong in body-fitness.
+# Bone-structure terms (big-boned, large-boned) excluded - structure not mass.
+# Pathology/swelling terms (bloated, swollen) excluded - temporary state.
+# Each line is an atom slug in text_lower form.
+
+ample
+chubby
+chunky
+corpulent
+fat
+fleshy
+heavy
+heavyset
+hefty
+obese
+overweight
+paunchy
+plump
+podgy
+portly
+potbellied
+pudgy
+roly-poly
+rotund
+stocky
+stout
+sumoesque
+tubby

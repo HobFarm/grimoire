@@ -1,0 +1,33 @@
+# body-mass-light
+# Source: body-light.txt + adj-general.txt body adjectives + skin_body.txt thin-type
+# Curator: d00d
+# Date: 2026-04-21
+# Axis: body-mass, Pole: low
+#
+# Terms describing low body mass as the primary reading.
+# Fitness-dominant terms (lean, athletic, toned) excluded - belong in body-fitness.
+# Height-dominant terms (tall, rangy when read as height) excluded - belong in body-height.
+# Pathology-dominant terms (emaciated, anorexic) excluded - belong in body-vitality (poor).
+# Each line is an atom slug in text_lower form.
+
+bony
+gangly
+gaunt
+lanky
+rawboned
+scraggy
+scrawny
+skeletal
+skinny
+slender
+slight
+slim
+spindly
+svelte
+sylphlike
+thin
+underweight
+waif-like
+willowy
+wiry
+wispy

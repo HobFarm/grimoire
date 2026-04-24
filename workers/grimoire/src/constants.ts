@@ -1,101 +1,17 @@
-export const VALID_CATEGORIES = [
-  'camera.lens', 'camera.shot', 'color.palette',
-  'composition.rule',
-  'covering.accessory', 'covering.clothing', 'covering.footwear',
-  'covering.headwear', 'covering.material', 'covering.outfit',
-  'domain.academia', 'domain.athletics', 'domain.aviation',
-  'domain.chemistry', 'domain.cuisine', 'domain.folklore',
-  'domain.law', 'domain.maritime', 'domain.medicine',
-  'domain.military', 'domain.occult', 'domain.technology',
-  'effect.post',
-  'environment.atmosphere', 'environment.natural', 'environment.prop', 'environment.setting',
-  'lighting.source',
-  'narrative.action', 'narrative.archetype', 'narrative.concept',
-  'narrative.mood', 'narrative.phrase', 'narrative.scene',
-  'negative.filter',
-  'object.drink', 'object.held',
-  'pose.interaction', 'pose.position',
-  'reference.character', 'reference.film', 'reference.game',
-  'reference.location', 'reference.person', 'reference.technique',
-  'style.era', 'style.genre', 'style.medium',
-  'subject.animal', 'subject.expression', 'subject.face', 'subject.feature',
-  'subject.form', 'subject.hair',
-] as const
-
 export const VALID_MODALITIES = ['visual', 'narrative', 'both'] as const
 
-export const CATEGORY_MODALITY: Record<string, string> = {
-  // visual only
-  'camera.lens': 'visual',
-  'camera.shot': 'visual',
-  'color.palette': 'visual',
-  'composition.rule': 'visual',
-  'covering.accessory': 'visual',
-  'covering.clothing': 'visual',
-  'covering.footwear': 'visual',
-  'covering.headwear': 'visual',
-  'covering.material': 'visual',
-  'covering.outfit': 'visual',
-  'effect.post': 'visual',
-  'lighting.source': 'visual',
-  'negative.filter': 'visual',
-  'object.drink': 'visual',
-  'object.held': 'visual',
-  'pose.interaction': 'visual',
-  'pose.position': 'visual',
-  'style.medium': 'visual',
-  'subject.expression': 'visual',
-  'subject.face': 'visual',
-  'subject.feature': 'visual',
-  'subject.form': 'visual',
-  'subject.hair': 'visual',
-  // narrative only
-  'domain.academia': 'narrative',
-  'domain.athletics': 'narrative',
-  'domain.aviation': 'narrative',
-  'domain.chemistry': 'narrative',
-  'domain.cuisine': 'narrative',
-  'domain.folklore': 'narrative',
-  'domain.law': 'narrative',
-  'domain.maritime': 'narrative',
-  'domain.medicine': 'narrative',
-  'domain.military': 'narrative',
-  'domain.occult': 'narrative',
-  'domain.technology': 'narrative',
-  'narrative.action': 'narrative',
-  'narrative.archetype': 'narrative',
-  'narrative.concept': 'narrative',
-  'narrative.phrase': 'narrative',
-  // both
-  'environment.atmosphere': 'both',
-  'environment.natural': 'both',
-  'environment.prop': 'both',
-  'environment.setting': 'both',
-  'narrative.mood': 'both',
-  'narrative.scene': 'both',
-  'reference.character': 'both',
-  'reference.film': 'both',
-  'reference.game': 'both',
-  'reference.location': 'both',
-  'reference.person': 'both',
-  'reference.technique': 'both',
-  'style.era': 'both',
-  'style.genre': 'both',
-  'subject.animal': 'both',
+export const HARMONIC_DIMENSIONS = [
+  'hardness', 'temperature', 'weight', 'formality', 'era_affinity',
+] as const
+
+export type HarmonicDimension = typeof HARMONIC_DIMENSIONS[number]
+
+export const HARMONIC_DEFAULTS: Record<string, number> = {
+  hardness: 0.5,
+  temperature: 0.5,
+  weight: 0.5,
+  formality: 0.5,
+  era_affinity: 0.5,
 }
 
-export const VALID_HARMONICS = {
-  hardness: ['hard', 'soft', 'neutral'] as const,
-  temperature: ['warm', 'cool', 'neutral'] as const,
-  weight: ['heavy', 'light', 'neutral'] as const,
-  formality: ['structured', 'organic', 'neutral'] as const,
-  era_affinity: ['archaic', 'industrial', 'modern', 'timeless'] as const,
-} as const
-
-export const HARMONIC_DEFAULTS: Record<string, string> = {
-  hardness: 'neutral',
-  temperature: 'neutral',
-  weight: 'neutral',
-  formality: 'neutral',
-  era_affinity: 'timeless',
-}
+export const VALID_UTILITIES = ['visual', 'literary', 'dual'] as const

@@ -4,7 +4,8 @@
 // Batches concepts in groups of 15 to stay within model output limits
 
 import type { AgentContext, KeyConcept, IndexingResult } from './types'
-import { callWithJsonParse } from './types'
+import { callWithJsonParse } from '@shared/providers/call-with-json-parse'
+import { MODELS } from '@shared/models'
 import { buildIndexingPrompt, buildIndexingUserMessage } from '../../prompts/pipeline-indexing'
 import { ingestAtom } from '@shared/grimoire/ingest'
 
@@ -62,6 +63,8 @@ export async function runIndexingAgent(
         userMessage,
         ctx.ai,
         ctx.geminiKey,
+        MODELS['pipeline.indexing'],
+        { onUsage: ctx.onUsage },
       )
       lastModelUsed = modelUsed
       if (aiResult.entries) {

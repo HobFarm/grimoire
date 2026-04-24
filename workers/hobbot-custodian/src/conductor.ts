@@ -1,14 +1,24 @@
 // Conductor: gap analysis + knowledge request generation
 // Runs on custodian's 6h cron. Queries Grimoire for thin arrangement/category pairs,
-// uses Gemini to translate gaps into search intents, writes prioritized knowledge_requests.
+// uses AI to translate gaps into search intents, writes prioritized knowledge_requests.
 
-import { GeminiProvider } from '@shared/providers/gemini'
 import { logAction } from '@shared/ledger'
+import { callWithJsonParse, type GatewayConfig, type CallOptions } from '@shared/providers/call-with-json-parse'
+import { resolveApiKey, createTokenLogger } from '@shared/providers'
+import { MODELS } from '@shared/models'
+import { createLogger } from '@shared/logger'
+
+const log = createLogger('hobbot-custodian')
 
 interface ConductorEnv {
   GRIMOIRE_DB: D1Database
   HOBBOT_DB: D1Database
+  AI: Ai
   GEMINI_API_KEY: string | { get: () => Promise<string> }
+  PROVIDER_HEALTH?: KVNamespace
+  AI_GATEWAY_ACCOUNT_ID?: string
+  AI_GATEWAY_NAME?: string
+  AI_GATEWAY_TOKEN?: string | { get: () => Promise<string> }
 }
 
 export interface ConductorResult {
@@ -32,10 +42,6 @@ interface ArrangementGap {
 
 const MAX_REQUESTS_PER_RUN = 5
 const MAX_PENDING_PER_AGENT = 10
-
-async function resolveApiKey(key: string | { get: () => Promise<string> }): Promise<string> {
-  return typeof key === 'string' ? key : await key.get()
-}
 
 // Step 1: Release stale claims (>2h uncompleted)
 async function releaseStale(db: D1Database): Promise<number> {
@@ -218,11 +224,22 @@ async function filterDuplicates(db: D1Database, gaps: ArrangementGap[]): Promise
   return gaps.filter(g => !existingSlugs.has(g.slug))
 }
 
-// Step 6: Gemini intent translation
+// Step 6: AI intent translation
+const INTENT_SYSTEM_PROMPT = `You translate knowledge gap data into targeted search intents for finding public domain texts.
+
+Respond with JSON: { "search_intent": "...", "source_agent": "archive_org" | "getty" | null }
+- source_agent "archive_org" for books and catalogs (depth content)
+- source_agent "getty" for vocabulary and terminology (AAT cross-reference)
+- source_agent null if either source could help`
+
 async function generateSearchIntent(
-  gemini: GeminiProvider,
+  ai: Ai,
+  geminiKey: string,
   gap: ArrangementGap,
   exemplars: string[],
+  health?: KVNamespace,
+  gateway?: GatewayConfig,
+  onUsage?: CallOptions['onUsage'],
 ): Promise<{ search_intent: string; source_agent: string | null }> {
   const thinCatDesc = gap.thin_categories.length > 0
     ? `Thin categories: ${gap.thin_categories.map(c => `${c.slug} (${c.count} atoms)`).join(', ')}`
@@ -232,44 +249,28 @@ async function generateSearchIntent(
     ? `\nExamples of good atoms in these categories from other arrangements: ${exemplars.join('; ')}`
     : ''
 
-  const prompt = `You translate knowledge gap data into targeted search intents for finding public domain texts.
-
-Arrangement: "${gap.name}" ${gap.description ? `- ${gap.description}` : ''}
+  const userContent = `Arrangement: "${gap.name}" ${gap.description ? `- ${gap.description}` : ''}
 Total atoms: ${gap.total_atoms}
 ${thinCatDesc}${exemplarBlock}
 
 Request type: ${gap.request_type}
 ${gap.request_type === 'baseline'
     ? 'Generate a broad search intent to establish foundational knowledge: key practitioners, materials, techniques, regional variations, relationship to adjacent movements.'
-    : 'Generate a focused search intent for finding specific vocabulary about materials, techniques, practitioners, and physical properties. NOT general historical narrative. We need terms that describe how things look, feel, and are made.'}
-
-Respond with JSON: { "search_intent": "...", "source_agent": "archive_org" | "getty" | null }
-- source_agent "archive_org" for books and catalogs (depth content)
-- source_agent "getty" for vocabulary and terminology (AAT cross-reference)
-- source_agent null if either source could help`
-
-  const response = await gemini.generateResponse({
-    messages: [
-      { role: 'user', content: prompt },
-    ],
-    temperature: 0.3,
-    maxTokens: 512,
-    responseFormat: 'json',
-  })
+    : 'Generate a focused search intent for finding specific vocabulary about materials, techniques, practitioners, and physical properties. NOT general historical narrative. We need terms that describe how things look, feel, and are made.'}`
 
   try {
-    // Strip markdown code fences if Gemini wraps the JSON
-    let jsonStr = response.content.trim()
-    if (jsonStr.startsWith('```')) {
-      jsonStr = jsonStr.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '')
-    }
-    const parsed = JSON.parse(jsonStr)
+    const { result, modelUsed } = await callWithJsonParse<{ search_intent?: string; source_agent?: string | null }>(
+      'conductor.intent', INTENT_SYSTEM_PROMPT, userContent, ai, geminiKey,
+      MODELS['custodian.intent'],
+      { health, gateway, onUsage },
+    )
+    log.info('intent generated', { model: modelUsed })
     return {
-      search_intent: parsed.search_intent ?? `Find content about ${gap.name}`,
-      source_agent: parsed.source_agent ?? null,
+      search_intent: result.search_intent ?? `Find content about ${gap.name}`,
+      source_agent: result.source_agent ?? null,
     }
   } catch {
-    // Meaningful fallback: include description for baseline, categories for gap_fill
+    // All models failed: construct a meaningful fallback
     const desc = gap.description ? ` (${gap.description})` : ''
     const catList = gap.thin_categories.length > 0
       ? `: ${gap.thin_categories.map(c => c.slug).join(', ')}`
@@ -309,13 +310,13 @@ export async function runConductor(env: ConductorEnv): Promise<ConductorResult> 
   // Step 1: Release stale claims
   const staleReleased = await releaseStale(env.HOBBOT_DB)
   if (staleReleased > 0) {
-    console.log(`[conductor] released ${staleReleased} stale claims`)
+    log.info('released stale claims', { count: staleReleased })
   }
 
   // Step 2: Complete finished requests
   const completed = await completeFinished(env.GRIMOIRE_DB, env.HOBBOT_DB)
   if (completed > 0) {
-    console.log(`[conductor] completed ${completed} ingesting requests`)
+    log.info('completed requests', { count: completed })
   }
 
   // Step 3: Check queue depth per agent
@@ -328,11 +329,11 @@ export async function runConductor(env: ConductorEnv): Promise<ConductorResult> 
 
   // Step 4: Gap analysis
   const allGaps = await analyzeGaps(env.GRIMOIRE_DB)
-  console.log(`[conductor] found ${allGaps.length} raw gaps`)
+  log.info('gap analysis complete', { raw_gaps: allGaps.length })
 
   // Step 5: Dedup
   const gaps = await filterDuplicates(env.HOBBOT_DB, allGaps)
-  console.log(`[conductor] ${gaps.length} gaps after dedup`)
+  log.info('gaps after dedup', { count: gaps.length })
 
   if (gaps.length === 0) {
     return { gaps: 0, created: 0, stale_released: staleReleased, completed, errors }
@@ -342,7 +343,7 @@ export async function runConductor(env: ConductorEnv): Promise<ConductorResult> 
   gaps.sort((a, b) => b.priority - a.priority)
   const toProcess = gaps.slice(0, MAX_REQUESTS_PER_RUN)
 
-  // Resolve Gemini API key
+  // Resolve Gemini API key (needed for fallback chain)
   let apiKey: string
   try {
     apiKey = await resolveApiKey(env.GEMINI_API_KEY)
@@ -351,7 +352,16 @@ export async function runConductor(env: ConductorEnv): Promise<ConductorResult> 
     return { gaps: gaps.length, created: 0, stale_released: staleReleased, completed, errors }
   }
 
-  const gemini = new GeminiProvider('gemini-2.5-flash', apiKey)
+  // Resolve gateway config for AI Gateway routing
+  let gateway: GatewayConfig | undefined
+  if (env.AI_GATEWAY_TOKEN && env.AI_GATEWAY_ACCOUNT_ID) {
+    try {
+      const token = typeof env.AI_GATEWAY_TOKEN === 'string'
+        ? env.AI_GATEWAY_TOKEN
+        : await env.AI_GATEWAY_TOKEN.get()
+      gateway = { accountId: env.AI_GATEWAY_ACCOUNT_ID, name: env.AI_GATEWAY_NAME ?? 'hobfarm', token }
+    } catch {}
+  }
 
   // Step 6: Generate intents and create requests
   for (const gap of toProcess) {
@@ -362,7 +372,7 @@ export async function runConductor(env: ConductorEnv): Promise<ConductorResult> 
         gap.thin_categories.map(c => c.slug),
       )
 
-      const { search_intent, source_agent } = await generateSearchIntent(gemini, gap, exemplars)
+      const { search_intent, source_agent } = await generateSearchIntent(env.AI, apiKey, gap, exemplars, env.PROVIDER_HEALTH, gateway, createTokenLogger(env.HOBBOT_DB, 'hobbot-custodian'))
 
       // Check agent-specific queue depth
       const agentKey = source_agent ?? '_any'

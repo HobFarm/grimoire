@@ -6,13 +6,19 @@ interface CorrespondenceCandidate {
   b: string
   type: string
   strength: number
+  scope: 'cross_category' | 'intra_category'
 }
+
+const CROSS_CATEGORY_THRESHOLD = 0.65
+const INTRA_CATEGORY_THRESHOLD = 0.75
+const MAX_CROSS_CATEGORY = 10
+const MAX_INTRA_CATEGORY = 5
 
 /**
  * Discover semantic correspondences for a batch of atoms.
  * Queries Vectorize for nearest neighbors, filters to cross-category matches,
  * validates neighbor IDs exist in D1 (Vectorize may contain stale vectors),
- * and inserts new correspondences with INSERT OR IGNORE.
+ * and upserts correspondences (keeping the higher strength on conflict).
  */
 export async function discoverSemanticBatch(
   db: D1Database,
@@ -37,34 +43,51 @@ export async function discoverSemanticBatch(
     }
   }
 
-  // Query neighbors sequentially
-  for (const atom of atoms) {
-    const vec = vectorMap.get(atom.id)
-    if (!vec) continue
-
-    try {
-      const matches = await vectorize.query(vec, {
+  // Query neighbors in parallel (concurrent Vectorize queries instead of sequential)
+  const queryResults = await Promise.allSettled(
+    atoms.map(async (atom) => {
+      const vec = vectorMap.get(atom.id)
+      if (!vec) return { atom, matches: [] as VectorizeMatch[] }
+      const result = await vectorize.query(vec, {
         topK: 50,
         returnMetadata: 'indexed',
         returnValues: false,
       })
+      return { atom, matches: result.matches }
+    })
+  )
 
-      let crossCatCount = 0
-      for (const match of matches.matches) {
-        if (match.id === atom.id) continue
-        const neighborCat = (match.metadata as Record<string, string> | undefined)?.category
-        if (!neighborCat || neighborCat === atom.category_slug) continue
-        if (match.score < 0.65) continue
-        if (crossCatCount >= 10) break
+  for (const settled of queryResults) {
+    if (settled.status === 'rejected') {
+      console.error(`[correspondence] query failed:`, settled.reason)
+      continue
+    }
+    const { atom, matches } = settled.value
+
+    let crossCatCount = 0
+    let intraCatCount = 0
+    for (const match of matches) {
+      if (match.id === atom.id) continue
+      const neighborCat = (match.metadata as Record<string, string> | undefined)?.category
+      if (!neighborCat) continue
+
+      const isSameCategory = neighborCat === atom.category_slug
+
+      if (isSameCategory) {
+        if (match.score < INTRA_CATEGORY_THRESHOLD) continue
+        if (intraCatCount >= MAX_INTRA_CATEGORY) continue
+        intraCatCount++
+      } else {
+        if (match.score < CROSS_CATEGORY_THRESHOLD) continue
+        if (crossCatCount >= MAX_CROSS_CATEGORY) continue
         crossCatCount++
-
-        neighborIds.add(match.id)
-        const type = match.score >= 0.75 ? 'resonates' : 'evokes'
-        const [lo, hi] = atom.id < match.id ? [atom.id, match.id] : [match.id, atom.id]
-        toInsert.push({ a: lo, b: hi, type, strength: Math.round(match.score * 1000) / 1000 })
       }
-    } catch (err) {
-      console.error(`[correspondence] query failed for atom ${atom.id}:`, err)
+
+      neighborIds.add(match.id)
+      const type = match.score >= 0.75 ? 'resonates' : 'evokes'
+      const scope = isSameCategory ? 'intra_category' as const : 'cross_category' as const
+      const [lo, hi] = atom.id < match.id ? [atom.id, match.id] : [match.id, atom.id]
+      toInsert.push({ a: lo, b: hi, type, strength: Math.round(match.score * 1000) / 1000, scope })
     }
   }
 
@@ -107,8 +130,12 @@ export async function discoverSemanticBatch(
     const chunk = unique.slice(i, i + 100)
     const stmts = chunk.map(corr =>
       db.prepare(
-        "INSERT OR IGNORE INTO correspondences (id, atom_a_id, atom_b_id, relationship_type, strength, provenance) VALUES (lower(hex(randomblob(8))), ?, ?, ?, ?, 'semantic')"
-      ).bind(corr.a, corr.b, corr.type, corr.strength)
+        `INSERT INTO correspondences (id, atom_a_id, atom_b_id, relationship_type, strength, provenance, arrangement_scope, scope, last_reinforced_at)
+         VALUES (lower(hex(randomblob(8))), ?, ?, ?, ?, 'semantic', '', ?, datetime('now'))
+         ON CONFLICT(atom_a_id, atom_b_id, relationship_type, arrangement_scope)
+         DO UPDATE SET strength = MAX(correspondences.strength, excluded.strength),
+                       last_reinforced_at = datetime('now')`
+      ).bind(corr.a, corr.b, corr.type, corr.strength, corr.scope)
     )
     const results = await db.batch(stmts)
     for (const r of results) {

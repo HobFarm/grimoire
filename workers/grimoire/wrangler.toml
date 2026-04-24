@@ -7,6 +7,12 @@ compatibility_flags = ["nodejs_compat"]
 binding = "DB"
 database_name = "grimoire-db"
 database_id = "3cb1cdee-17af-477c-ab0a-5a18447948ef"
+migrations_dir = "migrations"
+
+[[d1_databases]]
+binding = "HOBBOT_DB"
+database_name = "hobbot-db"
+database_id = "d91a32f8-670b-46a3-9008-f16224b2f8d7"
 
 [ai]
 binding = "AI"
@@ -15,15 +21,42 @@ binding = "AI"
 binding = "VECTORIZE"
 index_name = "grimoire-atoms"
 
+[[kv_namespaces]]
+binding = "PROVIDER_HEALTH"
+id = "30a7b9ccfd82493b9c96fbe994b40bbe"
+
+[[kv_namespaces]]
+binding = "CONNECTIVITY_KV"
+id = "006606a20c964fe5ba13b57e73fa972c"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "hobfarm-cdn"
+
+[[r2_buckets]]
+binding = "GRIMOIRE_R2"
+bucket_name = "grimoire"
+
 [vars]
-GEMINI_MODEL = "gemini-2.5-flash"
 AI_GATEWAY_ACCOUNT_ID = "e343cbfa70c5166f00d871e513ae352a"
 AI_GATEWAY_NAME = "hobfarm"
 ALLOWED_ORIGINS = "https://stylefusion.hob.farm,https://sf.hob.farm,https://hob.farm"
 
-# Secrets (set via wrangler secret put):
-# GEMINI_API_KEY
-# AI_GATEWAY_TOKEN
+# Secrets Store
+[[secrets_store_secrets]]
+binding = "GEMINI_API_KEY"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "gemini-api-key"
+
+[[secrets_store_secrets]]
+binding = "AI_GATEWAY_TOKEN"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "ai-gateway-token"
+
+[[secrets_store_secrets]]
+binding = "SERVICE_TOKENS"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "service-tokens"
 
 [triggers]
 crons = ["*/15 * * * *"]
@@ -33,3 +66,83 @@ enabled = true
 
 [limits]
 cpu_ms = 30000
+
+# --- Queues: Producers ---
+
+[[queues.producers]]
+queue = "grimoire-classify"
+binding = "CLASSIFY_QUEUE"
+
+[[queues.producers]]
+queue = "grimoire-discovery"
+binding = "DISCOVERY_QUEUE"
+
+[[queues.producers]]
+queue = "grimoire-vectorize"
+binding = "VECTORIZE_QUEUE"
+
+[[queues.producers]]
+queue = "grimoire-enrich"
+binding = "ENRICH_QUEUE"
+
+# --- Queues: Consumers ---
+
+[[queues.consumers]]
+queue = "grimoire-classify"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "grimoire-classify-dlq"
+max_concurrency = 1
+
+[[queues.consumers]]
+queue = "grimoire-discovery"
+max_batch_size = 5
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "grimoire-classify-dlq"
+max_concurrency = 1
+
+[[queues.consumers]]
+queue = "grimoire-vectorize"
+max_batch_size = 20
+max_batch_timeout = 15
+max_retries = 3
+dead_letter_queue = "grimoire-vectorize-dlq"
+max_concurrency = 2
+
+[[queues.consumers]]
+queue = "grimoire-enrich"
+max_batch_size = 50
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "grimoire-enrich-dlq"
+max_concurrency = 5
+
+# DLQ consumers (log failures to D1)
+[[queues.consumers]]
+queue = "grimoire-classify-dlq"
+max_batch_size = 10
+max_batch_timeout = 30
+
+[[queues.consumers]]
+queue = "grimoire-vectorize-dlq"
+max_batch_size = 10
+max_batch_timeout = 30
+
+[[queues.consumers]]
+queue = "grimoire-enrich-dlq"
+max_batch_size = 10
+max_batch_timeout = 30
+
+# --- Workflows ---
+
+[[workflows]]
+name = "grimoire-bulk-retag"
+binding = "BULK_RETAG_WORKFLOW"
+class_name = "BulkRetagWorkflow"
+
+[[workflows]]
+name = "grimoire-bulk-correspondences"
+binding = "BULK_CORRESPONDENCES_WORKFLOW"
+class_name = "BulkCorrespondencesWorkflow"

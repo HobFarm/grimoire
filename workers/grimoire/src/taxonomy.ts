@@ -1,11 +1,9 @@
-import { VALID_CATEGORIES } from './constants'
-
-export { VALID_CATEGORIES }
-
 /**
  * Canonical mapping from category_slug to collection_slug.
  * Single source of truth. Gemini returns category_slug only;
  * collection_slug is always derived from this map.
+ *
+ * Future: move to a default_collection column on the categories table.
  */
 export const CATEGORY_TO_COLLECTION: Record<string, string> = {
   // Subject
@@ -83,6 +81,21 @@ export const CATEGORY_TO_COLLECTION: Record<string, string> = {
 /** Derive collection_slug from category_slug. Falls back to 'uncategorized'. */
 export function collectionFromCategory(cat: string): string {
   return CATEGORY_TO_COLLECTION[cat] || 'uncategorized'
+}
+
+/**
+ * Validate that CATEGORY_TO_COLLECTION covers all DB categories.
+ * Logs warnings for any gaps. Call from cron handler.
+ */
+export async function validateTaxonomyMaps(db: D1Database): Promise<void> {
+  const { results } = await db.prepare('SELECT slug FROM categories ORDER BY slug').all<{ slug: string }>()
+  const dbSlugs = results.map(r => r.slug)
+
+  for (const slug of dbSlugs) {
+    if (!(slug in CATEGORY_TO_COLLECTION)) {
+      console.warn(`[taxonomy] DB category "${slug}" has no CATEGORY_TO_COLLECTION mapping. Atoms will default to "uncategorized".`)
+    }
+  }
 }
 
 const GENERIC_TERMS = new Set([

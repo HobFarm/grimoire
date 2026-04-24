@@ -1,0 +1,45 @@
+name = "reddit-scanner"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["0 */4 * * *", "0 */6 * * *", "0 8,20 * * *", "0 6 * * *", "0 7 * * *"]
+
+[[d1_databases]]
+binding = "REDDIT_SCANNER_DB"
+database_name = "reddit-scanner-db"
+database_id = "d9ba2216-065a-4d64-bd33-e46ea373f5f5"
+
+[[r2_buckets]]
+binding = "REDDIT_SCANS"
+bucket_name = "reddit-scanner-data"
+
+[[kv_namespaces]]
+binding = "PROVIDER_HEALTH"
+id = "30a7b9ccfd82493b9c96fbe994b40bbe"
+preview_id = "85429dee6bca4fb58ad8e032510cc7b0"
+
+[ai]
+binding = "AI"
+
+[vars]
+ENVIRONMENT = "production"
+
+# Secrets Store (Gemini fallback key)
+[[secrets_store_secrets]]
+binding = "GEMINI_API_KEY"
+store_id = "e1efb254fa9e40359b0b3bdeab02b082"
+secret_name = "gemini-api-key"
+
+# No Reddit secrets needed: uses public RSS feeds (no auth required)
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
