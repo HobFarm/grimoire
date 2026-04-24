@@ -567,3 +567,128 @@ export interface ConnectivityStatsDaily {
   runs: ConnectivityStatsRun[]
   totals: ConnectivityStatsDailyTotals
 }
+
+// --- Manifest Builder ---
+
+export interface ManifestSpec {
+  v: 1
+  slug: string
+  name: string
+  description: string
+  include: {
+    category_prefixes: string[]
+    category_exact?: string[]
+    tag_categories?: string[]
+    tags?: string[]
+  }
+  exclude?: {
+    category_prefixes?: string[]
+    tags?: string[]
+  }
+  correspondence_filter?: {
+    internal_only?: boolean
+    provenances?: string[]
+  }
+}
+
+export interface HarmonicsCompact {
+  h: number
+  t: number
+  w: number
+  f: number
+  e: number
+  r: number
+}
+
+export interface ManifestRelation {
+  id: string
+  type: string
+  s: number
+  p: string
+}
+
+export interface ManifestAtom {
+  id: string
+  text: string
+  cat: string
+  h: HarmonicsCompact
+  tags?: string[]
+  poles?: Record<string, string>
+  rel?: ManifestRelation[]
+}
+
+export interface ManifestStats {
+  atom_count: number
+  correspondence_count: number
+  tag_count: number
+  membership_count: number
+  build_duration_ms: number
+}
+
+export interface Manifest {
+  v: 1
+  slug: string
+  name: string
+  description: string
+  built_at: string
+  stats: ManifestStats
+  atoms: ManifestAtom[]
+}
+
+export interface ManifestMeta {
+  slug: string
+  name: string
+  built_at: string
+  stats: ManifestStats
+  size_bytes?: number
+}
+
+export interface GraphAtom {
+  id: string
+  text: string
+  category_slug: string
+  h: HarmonicsCompact
+}
+
+export interface GraphCorrespondence {
+  target: string
+  type: string
+  s: number
+  p: string
+  a_id: string
+  b_id: string
+}
+
+export interface GraphTag {
+  slug: string
+  category: string
+}
+
+export interface GraphSnapshot {
+  atoms: Map<string, GraphAtom>
+  atomTags: Map<string, GraphTag[]>
+  memberships: Map<string, Record<string, string>>
+  correspondences: Map<string, GraphCorrespondence[]>
+  loadDurationMs: number
+  stats: {
+    atoms_loaded: number
+    atom_tags_loaded: number
+    memberships_loaded: number
+    correspondences_loaded: number
+    harmonics_parse_failures: number
+  }
+}
+
+export interface ManifestBuildSummary {
+  slug: string
+  name: string
+  stats: ManifestStats
+  bytes: number
+}
+
+export interface ManifestBuildResult {
+  graph_load_ms: number
+  total_ms: number
+  manifests: ManifestBuildSummary[]
+  skipped: Array<{ slug: string; reason: string }>
+}

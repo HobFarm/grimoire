@@ -13,6 +13,7 @@ import { imageApp } from './fromImage'
 import { moodboardApp } from './routes/moodboard'
 import { moodboardAnalysisApp } from './routes/moodboard-analysis'
 import { dimensionApp } from './routes/dimension'
+import { manifestsApp } from './routes/manifests'
 import { resolveApp } from './resolve'
 import { invoke, InvokeError } from './invoke'
 import { scanAndEnqueue } from './cron'
@@ -129,6 +130,7 @@ app.route('/admin', adminApp)
 app.route('/admin/moodboard', moodboardApp)
 app.route('/admin/moodboard', moodboardAnalysisApp)
 app.route('/admin/dimension', dimensionApp)
+app.route('/admin/manifests', manifestsApp)
 app.route('/knowledge', knowledgeApp)
 app.route('/image', imageApp)
 app.route('/api/v1/resolve', resolveApp)
@@ -153,8 +155,8 @@ export { BulkCorrespondencesWorkflow } from './workflows'
 export default {
   fetch: app.fetch,
 
-  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
-    await scanAndEnqueue(env)
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    await scanAndEnqueue(env, ctx)
   },
 
   async queue(

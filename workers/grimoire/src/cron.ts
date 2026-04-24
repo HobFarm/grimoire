@@ -17,10 +17,13 @@ import {
   recordFailedBatch,
 } from './connectivity'
 import { createLogger } from '@shared/logger'
+import { buildAllManifests } from './manifests'
 
 const log = createLogger('grimoire')
 
 const ENQUEUE_GUARD_MINUTES = 30
+const MANIFEST_REBUILD_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000
+const MANIFEST_LAST_BUILD_KV_KEY = 'manifests:last_build'
 
 async function logExecution(
   db: D1Database, phase: string, startTime: number,
@@ -36,7 +39,7 @@ async function logExecution(
   }
 }
 
-export async function scanAndEnqueue(env: Env): Promise<void> {
+export async function scanAndEnqueue(env: Env, ctx: ExecutionContext): Promise<void> {
   const cycleStart = Date.now()
   let totalEnqueued = 0
 
@@ -302,8 +305,26 @@ export async function scanAndEnqueue(env: Env): Promise<void> {
             await setWatermark(env.CONNECTIVITY_KV, nextWatermark)
           }
         } else if (watermark !== '') {
-          // Wrap-around: reset so next tick restarts from beginning of table
+          // Wrap-around: reset so next tick restarts from beginning of table.
+          // A full connectivity sweep just completed — natural signal to rebuild manifests,
+          // guarded by a 24h floor so quiet-period rapid wraps don't thrash the build.
           await setWatermark(env.CONNECTIVITY_KV, '')
+          const lastBuildRaw = await env.CONNECTIVITY_KV.get(MANIFEST_LAST_BUILD_KV_KEY)
+          const lastBuild = lastBuildRaw ? parseInt(lastBuildRaw, 10) : 0
+          if (Date.now() - lastBuild >= MANIFEST_REBUILD_MIN_INTERVAL_MS) {
+            log.info('Connectivity sweep wrap-around: triggering manifest rebuild', {
+              last_build_ms_ago: lastBuild ? Date.now() - lastBuild : null,
+            })
+            ctx.waitUntil(
+              buildAllManifests(env).catch(err =>
+                log.error('Manifest rebuild after sweep wrap-around failed', { error: String(err) })
+              )
+            )
+          } else {
+            log.info('Connectivity sweep wrap-around: skipping manifest rebuild (within 24h floor)', {
+              last_build_ms_ago: Date.now() - lastBuild,
+            })
+          }
         }
       }
 
