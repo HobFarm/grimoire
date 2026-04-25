@@ -641,6 +641,7 @@ export interface ManifestMeta {
   built_at: string
   stats: ManifestStats
   size_bytes?: number
+  gzip_bytes?: number
 }
 
 export interface GraphAtom {
@@ -684,6 +685,7 @@ export interface ManifestBuildSummary {
   name: string
   stats: ManifestStats
   bytes: number
+  gzip_bytes: number
 }
 
 export interface ManifestBuildResult {

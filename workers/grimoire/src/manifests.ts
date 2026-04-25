@@ -394,24 +394,37 @@ async function loadSpec(r2: R2Bucket, key: string): Promise<unknown | null> {
   }
 }
 
-async function writeManifest(r2: R2Bucket, manifest: Manifest): Promise<number> {
+async function gzipString(s: string): Promise<ArrayBuffer> {
+  const stream = new Blob([s]).stream().pipeThrough(new CompressionStream('gzip'))
+  return await new Response(stream).arrayBuffer()
+}
+
+async function writeManifest(
+  r2: R2Bucket,
+  manifest: Manifest
+): Promise<{ raw: number; gzipped: number }> {
   const body = JSON.stringify(manifest)
+  const gzipped = await gzipString(body)
   const meta: ManifestMeta = {
     slug: manifest.slug,
     name: manifest.name,
     built_at: manifest.built_at,
     stats: manifest.stats,
     size_bytes: body.length,
+    gzip_bytes: gzipped.byteLength,
   }
+  // Manifest is gzipped on disk (Content-Encoding: gzip); browsers/curl/fetch
+  // auto-decompress. Sidecar meta stays uncompressed — it's small and the
+  // listing endpoint reads it on every call.
   await Promise.all([
-    r2.put(`manifests/${manifest.slug}.json`, body, {
-      httpMetadata: { contentType: 'application/json' },
+    r2.put(`manifests/${manifest.slug}.json`, gzipped, {
+      httpMetadata: { contentType: 'application/json', contentEncoding: 'gzip' },
     }),
     r2.put(`manifests/${manifest.slug}.meta.json`, JSON.stringify(meta), {
       httpMetadata: { contentType: 'application/json' },
     }),
   ])
-  return body.length
+  return { raw: body.length, gzipped: gzipped.byteLength }
 }
 
 // --- Build all / subset ---
@@ -482,14 +495,21 @@ export async function buildAllManifests(
   for (const spec of specs) {
     try {
       const manifest = buildManifest(spec, graph)
-      const bytes = await writeManifest(env.GRIMOIRE_R2, manifest)
+      const { raw, gzipped } = await writeManifest(env.GRIMOIRE_R2, manifest)
       out.push({
         slug: spec.slug,
         name: spec.name,
         stats: manifest.stats,
-        bytes,
+        bytes: raw,
+        gzip_bytes: gzipped,
       })
-      log.info('Manifest built', { slug: spec.slug, atom_count: manifest.stats.atom_count, bytes })
+      log.info('Manifest built', {
+        slug: spec.slug,
+        atom_count: manifest.stats.atom_count,
+        bytes: raw,
+        gzip_bytes: gzipped,
+        gzip_ratio: raw > 0 ? +(gzipped / raw).toFixed(3) : null,
+      })
     } catch (err) {
       log.error('Manifest build failed', { slug: spec.slug, error: String(err) })
       skipped.push({ slug: spec.slug, reason: `build error: ${String(err)}` })
