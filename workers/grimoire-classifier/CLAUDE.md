@@ -18,7 +18,8 @@ Verify against `wrangler.toml` before making changes. If this list and wrangler.
 | Binding | Type | Purpose |
 |---------|------|---------|
 | GRIMOIRE_DB | D1 (grimoire-db) | Direct read/write to atoms table |
-| AI | Workers AI | Primary classification provider (Nemotron) |
+| HOBBOT_DB | D1 (hobbot-db) | Read access for cross-worker queries |
+| AI | Workers AI | Primary classification provider (per model registry) |
 | PROVIDER_HEALTH | KV | Circuit breaker state (shared across workers) |
 | GEMINI_API_KEY | Secrets Store | Gemini API auth (fallback) |
 | AI_GATEWAY_TOKEN | Secrets Store | Cloudflare AI Gateway auth |
@@ -82,7 +83,7 @@ Post-parse validation:
 
 ### Harmonic Dimensions (numeric 0.0-1.0)
 
-This worker outputs numeric 0.0-1.0 harmonic scores, matching the grimoire worker's queue-based classifier.
+This worker outputs the 5-key harmonics JSON blob written to `atoms.harmonics`, matching the grimoire worker's queue-based classifier. **It does not score `register`** — that's a separate REAL column populated by Phase 5 in the grimoire worker.
 
 | Dimension | 0.0 | 1.0 |
 |-----------|-----|-----|
@@ -105,9 +106,9 @@ D1 batch limit is 100 statements. The worker chunks writes into groups of 50.
 
 ## Known Issues and Tech Debt
 
-**Inline prompt.** The CLASSIFICATION_PROMPT is a ~100-line template literal in the main file. Should be extracted to a dedicated prompt file or constant module.
+**Inline prompt.** The CLASSIFICATION_PROMPT is a long template literal in the main file. Should be extracted to a dedicated prompt file or constant module — same pattern as the grimoire worker's `src/prompts/` directory.
 
-**Single-file worker.** Core logic is in index.ts (~300 lines) with ai.ts as provider utility (~200 lines). Acceptable for the worker's focused scope.
+**Single-file worker.** Core logic is in `index.ts` with `ai.ts` as a small provider utility. Acceptable for the worker's focused scope; if logic outgrows ~500 lines per file, split it.
 
 ## File Structure
 

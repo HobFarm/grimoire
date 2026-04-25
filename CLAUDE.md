@@ -70,16 +70,23 @@ Knowledge enters as documents (essays, wiki pages, articles, PDFs) through HobBo
 
 ## Continuous Processing Pipeline
 
-After ingestion, atoms flow through a 6-phase cron-driven pipeline (runs every 15 minutes in the grimoire worker):
+After ingestion, atoms flow through the cron-driven pipeline in the grimoire worker (runs every 15 minutes). Phases are numbered 1–6 plus 8 (no Phase 7):
 
 1. **Classification**: New atoms get category assignment
-2. **Vectorization**: Classified atoms get embeddings (768-dim, bge-base-en-v1.5)
-3. **Harmonics enrichment**: Classified atoms get scored on 6 harmonic dimensions
+2. **Vectorization**: Classified atoms get embeddings (bge-base-en-v1.5)
+3. **Harmonics enrichment**: Classified atoms get scored on the 6 harmonic dimensions
 4. **Arrangement tagging**: Atoms with harmonics get matched to arrangement profiles
 5. **Register classification**: Atoms get register dimension scoring
 6. **Correspondence discovery**: Embedded atoms get semantic neighbors linked
+8. **Connectivity Agent**: Event-driven KV queue (populated at atom-confirmation hook points) plus a watermark-based sweep, runs three algorithmic scorers per atom — tag propagation from vector neighbors, dimensional pole membership, and correspondence discovery for under-connected atoms
 
-Each phase has its own queue with independent concurrency and retry settings. A 30-minute re-enqueue guard prevents duplicate processing. See `workers/grimoire/CLAUDE.md` for queue configuration details.
+Phases 1–6 use Cloudflare Queues for fan-out. Phase 8 uses a KV queue (no producer-side rate limiting needed; events are already coalesced). A 30-minute re-enqueue guard prevents duplicate processing on Phases 1–6. See `workers/grimoire/CLAUDE.md` for queue configuration details.
+
+## Manifest Builder
+
+The grimoire worker also packages the graph into pre-computed JSON files in R2. Specs live at `grimoire://specs/manifests/{slug}.json`; built manifests land at `grimoire://manifests/{slug}.json` (gzipped, served with `Content-Encoding: gzip`) plus a small `.meta.json` sidecar for cheap listing.
+
+Build via `POST /admin/manifests/build` (all) or `POST /admin/manifests/build/:slug` (one). List via `GET /admin/manifests`. Auto-rebuilds when the Connectivity Agent's sweep wraps around the atom table (gated by a 24h floor in the `manifests:last_build` KV key).
 
 ## Harmonic Dimensions
 
@@ -96,11 +103,17 @@ Every atom carries six harmonic scores (0.0 to 1.0):
 
 These enable arrangement matching: StyleFusion queries for vocabulary whose harmonic profile matches the target arrangement's ranges.
 
-## Database Ownership
+## Database & Object Ownership
 
 **GRIMOIRE_DB is owned exclusively by the grimoire worker.** All other workers access it through service binding RPC or shared D1 read bindings.
 
 Exception: grimoire-classifier has a direct D1 write binding for bulk classification operations. This is a pragmatic exception, not a pattern to replicate.
+
+The grimoire worker also owns the `grimoire` R2 bucket (binding `GRIMOIRE_R2`), which holds:
+- `manifests/` — built domain manifests (gzipped JSON) + `.meta.json` sidecars
+- `specs/manifests/` — manifest spec files driving the builder
+- `moodboards/` — IR JSON for moodboard analysis
+- `images/`, `analysis/` — reference images and analysis docs
 
 Table groups by layer:
 
@@ -108,16 +121,28 @@ Table groups by layer:
 **Layer 2:** document_chunks (content, summary, categories, arrangement_slugs, quality_score)
 **Layer 3:** categories, category_relations, collections, arrangements, category_contexts
 **Layer 4:** atoms (term, category_slug, description, harmonics, status, embedding_status, register, tag_version, last_enqueued_at)
-**Layer 5:** atom_relations, correspondences
-**Operational:** exemplars, incantations, incantation_slots, discovery_queue, validation_log, integrity_scans, usage_log, evolve_reports, provider_behaviors, ingest_log, agent_budgets
+**Layer 5:** atom_relations, correspondences, atom_tags (FK to tags by integer id), tags, dimension_memberships
+**Operational:** exemplars, incantations, incantation_slots, discovery_queue, validation_log, integrity_scans, execution_log, failed_operations, usage_log, evolve_reports, provider_behaviors, ingest_log, agent_budgets, moodboards
 
 Query the database for the actual schema. This list may be incomplete.
+
+## Schema Conventions
+
+Knowing these saves a debug cycle when you write SQL or types:
+
+- **`atoms.id`** is a 16-char hex TEXT (`generateId()`), not an integer. `atoms.harmonics` is a JSON TEXT blob with 5 keys (hardness, temperature, weight, formality, era_affinity, all numeric 0.0–1.0); **`register` is a separate REAL column**, not inside the JSON.
+- **`atom_tags`** is a join table with PK `(atom_id, tag_id)`. `tag_id` is an INTEGER FK to `tags.id` (not a slug). Tag slugs use the `{category}:{name}` pattern (e.g. `movement:abstract-expressionism`).
+- **`dimension_memberships`** has PK `(atom_id, axis_slug)`; `pole` is constrained to `low|high`.
+- **`correspondences.provenance`** is constrained to `harmonic|semantic|exemplar|co_occurrence`. `relationship_type` values: `resonates|opposes|requires|substitutes|evokes`.
+- **`atoms.status`** is constrained to `provisional|confirmed|rejected`. Custom values are not allowed.
+- **Composite-PK tables** (`atom_tags`, `dimension_memberships`) need `rowid > ?` cursor pagination, not `atom_id > ?` — the latter skips rows within the same atom.
+- **Migration sequence is at 0033+**. Both HobBot (001–005) and grimoire (0001–0033+) migrations are tracked in `d1_migrations`; wrangler resolves which is which via `migrations_dir` per worker.
 
 ## Worker Topology
 
 | Worker | Role | CLAUDE.md |
 |--------|------|-----------|
-| workers/grimoire | Knowledge graph owner. Classification, vectorization, search, taxonomy, queues, workflows. | workers/grimoire/CLAUDE.md |
+| workers/grimoire | Knowledge graph owner. Classification, vectorization, search, taxonomy, queues, workflows, Connectivity Agent, Manifest Builder, resolver, moodboard analysis. | workers/grimoire/CLAUDE.md |
 | workers/grimoire-classifier | Bulk classification and harmonization. Manual trigger only. | workers/grimoire-classifier/CLAUDE.md |
 
 ### How Other HobBot Workers Interact
@@ -156,9 +181,10 @@ The model registry is the single source of truth for all model strings and fallb
 
 ## What NOT To Do
 
-- Do not insert atoms directly to "seed" the Grimoire. Submit knowledge documents through HobBot's ingest pipeline.
+- Do not insert atoms directly to "seed" the Grimoire. Submit knowledge documents through HobBot's ingest pipeline. Atom-creation hook points (`createAtomWithHooks`, `bulkInsertAtomsWithHooks`, `encounterAtomWithHooks` in `workers/grimoire/src/atoms.ts`) enqueue Connectivity-Agent work; bypassing them leaves new atoms disconnected from the graph.
 - Do not treat vocabulary entry count as a quality metric.
 - Do not write to GRIMOIRE_DB from workers outside the Grimoire topology (grimoire + grimoire-classifier).
-- Do not hardcode model version strings. They belong in the shared model registry.
-- Do not reference specific counts in documentation or comments.
+- Do not hardcode model version strings, category slugs, or arrangement lists. They belong in the model registry / database; query at runtime.
+- Do not reference specific counts (atoms, correspondences, categories) in documentation or comments — they go stale fast.
 - Do not change embedding models or vector dimensions without explicit approval and a re-vectorization plan.
+- Do not modify Phases 1–7 cron logic or Phase 8 Connectivity Agent without understanding the queue + KV-watermark interaction. The 30-min re-enqueue guard, the `last_enqueued_at` column, and the `connectivity:watermark` KV key are all load-bearing.

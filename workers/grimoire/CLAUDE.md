@@ -18,11 +18,16 @@ Verify against `wrangler.toml` before making changes. If this list and wrangler.
 | Binding | Type | Purpose |
 |---------|------|---------|
 | DB | D1 (grimoire-db) | All five knowledge layers |
+| HOBBOT_DB | D1 (hobbot-db) | Read-only access for cross-worker queries |
 | AI | Workers AI | Embeddings, reranking, classification fallback |
-| VECTORIZE | Vectorize (grimoire-atoms) | Semantic search index (768-dim) |
+| VECTORIZE | Vectorize (grimoire-atoms) | Semantic search index (bge-base-en-v1.5) |
+| R2 | R2 (hobfarm-cdn) | Daily review markdown output |
+| GRIMOIRE_R2 | R2 (grimoire) | Manifests, specs, moodboards, image refs, analysis docs |
 | PROVIDER_HEALTH | KV | Circuit breaker state (shared across workers) |
+| CONNECTIVITY_KV | KV | Phase 8 event queue, sweep watermark, daily stats, `manifests:last_build` |
 | GEMINI_API_KEY | Secrets Store | Gemini API auth |
 | AI_GATEWAY_TOKEN | Secrets Store | Cloudflare AI Gateway auth |
+| SERVICE_TOKENS | Secrets Store | CSV of `name:secret` pairs guarding `/admin/*` and `/api/v1/*` |
 | CLASSIFY_QUEUE | Queue producer | grimoire-classify |
 | DISCOVERY_QUEUE | Queue producer | grimoire-discovery |
 | VECTORIZE_QUEUE | Queue producer | grimoire-vectorize |
@@ -40,20 +45,50 @@ Verify against `wrangler.toml` before making changes. If this list and wrangler.
 
 ## Scheduled Task: scanAndEnqueue
 
-Runs every 15 minutes. Scans D1 for unprocessed atoms and dispatches to queues. Six phases, each with a 30-minute re-enqueue guard (`last_enqueued_at` check) to prevent duplicate processing.
+Runs every 15 minutes. Scans D1 for unprocessed atoms and dispatches to queues, plus runs Phase 8 inline. Phases 1–6 use the `last_enqueued_at` 30-minute re-enqueue guard to prevent duplicate processing. Phase numbering jumps from 6 to 8 (no Phase 7).
 
 | Phase | What It Finds | Queue Target | Limit |
 |-------|--------------|--------------|-------|
 | 1 | Unclassified atoms (no category_slug) | grimoire-classify | 200 |
-| 2 | Pending embeddings (embedding_status='pending') | grimoire-vectorize | 100 |
+| 2 | Pending atom embeddings | grimoire-vectorize | 100 |
+| 2b | Pending document_chunk embeddings | grimoire-vectorize | 100 |
 | 3 | Missing harmonics (empty or null) | grimoire-classify (enrich-harmonics) | 10 |
 | 4 | Stale arrangement tags (tag_version < current) | grimoire-enrich (tag-arrangements) | 50 |
 | 5 | Missing register classification | grimoire-classify (classify-register) | 10 |
 | 6 | Atoms with no semantic correspondences | grimoire-enrich (discover-correspondences) | 200 |
+| 8 | Connectivity Agent: drains `CONNECTIVITY_KV` event queue, then runs a watermark-based sweep | inline, KV queue only | batch sized in `connectivity.ts` |
 
 Queue sendBatch max is 100 messages. Phase 1 and 6 chunk into batches of 100.
 
+Phase 8 also triggers the **Manifest Builder** when its sweep wraps around the atom table (watermark resets to `''`). Guarded by a 24-hour floor in the `manifests:last_build` KV key so quiet-period rapid wraps don't thrash the build. The trigger uses `ctx.waitUntil()` so the cron tick returns immediately while the build runs in background.
+
 All cron phase queries depend on D1 indexes for performance. See "D1 Query Performance" under Rules for CC before modifying any phase query.
+
+## Connectivity Agent (Phase 8)
+
+Maintains graph density as new atoms arrive. Fully event-driven with a sweep fallback:
+
+- **Event path:** `createAtomWithHooks`, `bulkInsertAtomsWithHooks`, and `encounterAtomWithHooks` in `src/atoms.ts` enqueue atom IDs into the `CONNECTIVITY_KV` queue at confirmation time. Phase 8 drains a batch each tick.
+- **Sweep path:** when the event queue is empty, Phase 8 walks the atoms table by `id > watermark` using `connectivity:watermark` in KV. Already-connected atoms are skipped inside `processConnectivityBatch`. Sweep failures advance the watermark anyway (poison-atom protection) and log to `connectivity:failed:{date}`.
+
+Three algorithmic scorers per atom (no LLM):
+- **Tag propagation** — if 3+ of an atom's nearest vector neighbors share a tag, apply it
+- **Dimensional membership** — score against pole centroids cached in `connectivity:axis:{slug}:centroids`
+- **Correspondence discovery** — connect under-connected atoms to high-similarity neighbors
+
+## Manifest Builder
+
+Packages domain-specific slices of the graph into pre-computed JSON files in R2. See `src/manifests.ts`, `src/routes/manifests.ts`.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /admin/manifests/build` | Build all specs found under `specs/manifests/` |
+| `POST /admin/manifests/build/:slug` | Rebuild a single manifest |
+| `GET /admin/manifests` | List built manifests (reads `.meta.json` sidecars, not the multi-MB JSON files) |
+
+Outputs `grimoire://manifests/{slug}.json` (gzipped, served with `Content-Encoding: gzip`) plus a small `.meta.json` sidecar. Default correspondence-provenance filter is `[harmonic, semantic]` — `co_occurrence` is excluded by default to keep the in-memory snapshot under the worker memory ceiling. Specs can opt in via `correspondence_filter.provenances`.
+
+Auto-rebuilds on Connectivity Agent sweep wrap-around (24h KV floor in `manifests:last_build`).
 
 ## Queues
 
@@ -166,9 +201,21 @@ Exported from `src/workflows.ts`. Cloudflare requires class exports from the mai
 
 ### Admin
 
+All `/admin/*` and `/api/v1/*` routes require `Authorization: Bearer <secret>` matching one of the entries in the `SERVICE_TOKENS` Secrets Store CSV. The server splits each `name:secret` pair on the colon and compares against just the `secret` portion — clients send only that bare secret, **not** the `name:secret` pair.
+
+| Method | Route | Purpose |
+|--------|-------|---------|
 | POST | /admin/tag-arrangements | Bulk arrangement tagging (one-shot) |
-| * | /admin/* | Admin sub-app (see src/admin.ts) |
-| * | /knowledge/* | Knowledge sub-app (see src/knowledge.ts) |
+| POST | /admin/manifests/build | Rebuild all manifests |
+| POST | /admin/manifests/build/:slug | Rebuild a single manifest |
+| GET | /admin/manifests | List built manifests with metadata |
+| * | /admin/* | Admin sub-app (see `src/admin.ts`) |
+| * | /admin/moodboard/* | Moodboard sub-apps (see `src/routes/moodboard.ts`, `routes/moodboard-analysis.ts`) |
+| * | /admin/dimension/* | Dimensional vocab sub-app |
+| * | /knowledge/* | Knowledge sub-app (see `src/knowledge.ts`) |
+| * | /image/* | Image extraction sub-app |
+| POST | /api/v1/resolve | Phrase-to-atom resolver (used by StyleFusion) |
+| GET | /review/daily | Daily review markdown (no auth; service-binding-only access in practice) |
 
 ### Service Binding RPC (invoke)
 
@@ -176,20 +223,21 @@ The `invoke()` function handles typed RPC calls from other workers via service b
 
 ## AI Call Sites
 
-Every AI call in this worker. If you add, remove, or change a model, update this section.
+Every AI call in this worker routes through the model registry at `HobBot/src/shared/models.ts`. The registry maps task names (`grimoire.classify`, `grimoire.classify-register`, `grimoire.discover`, `grimoire.decompose`, `moodboard.aggregate`, etc.) to a primary model + fallback chain. **Don't list specific model strings here** — they change. Read `models.ts` for current values.
 
-| Function | File | Task | Primary Model | Fallback Chain | Context |
-|----------|------|------|--------------|----------------|---------|
-| vectorizeAtomBatch() | src/vectorize.ts | Embedding generation | @cf/baai/bge-base-en-v1.5 | none | ~100 texts/batch |
-| vectorizeChunkBatch() | src/vectorize.ts | Chunk embeddings | @cf/baai/bge-base-en-v1.5 | none | ~100 texts/batch |
-| searchAtoms() | src/vectorize.ts | Query embedding | @cf/baai/bge-base-en-v1.5 | none | 1 query |
-| searchDocumentChunks() | src/vectorize.ts | Query embedding | @cf/baai/bge-base-en-v1.5 | none | 1 query |
-| rerankCandidates() | src/reranker.ts | Cross-encoder rerank | @cf/baai/bge-reranker-base | none | query + candidates |
-| classifyAtom() | src/atom-classify.ts | Category + harmonics | @cf/nvidia/nemotron-3-120b-a12b | gemini-2.5-flash-lite, gemini-2.5-flash | ~600 tok |
-| classifyRegister() | src/atom-classify.ts | Register scoring | @cf/ibm-granite/granite-4.0-h-micro | gemini-2.5-flash-lite, gemini-2.5-flash | ~400 tok |
-| discoverAtom() | src/suggest.ts | New term discovery | @cf/nvidia/nemotron-3-120b-a12b | gemini-2.5-flash, qwen3-30b | ~500 tok |
-| decomposeAtom() | src/suggest.ts | Concept decomposition | @cf/nvidia/nemotron-3-120b-a12b | gemini-2.5-flash, qwen3-30b | ~600 tok |
-| classifyText() | src/classify.ts | Text classification | @cf/qwen/qwen3-30b-a3b-fp8 | gemini-2.5-flash (gateway, direct) | ~500 tok |
+Functions performing AI calls:
+
+| Function | File | Task | Notes |
+|----------|------|------|-------|
+| `vectorizeAtomBatch()` | `src/vectorize.ts` | Atom embeddings | Batch of ~100 texts via `env.AI.run()` |
+| `vectorizeChunkBatch()` | `src/vectorize.ts` | Chunk embeddings | Batch of ~100 texts |
+| `searchAtoms()` / `searchDocumentChunks()` | `src/vectorize.ts` | Query embedding | Single text |
+| `rerankCandidates()` | `src/reranker.ts` | Cross-encoder rerank | Query + candidates |
+| `classifyAtom()` | `src/atom-classify.ts` | Category + harmonics | Reads task `grimoire.classify` from registry |
+| `classifyRegister()` | `src/atom-classify.ts` | Register scoring | Reads task `grimoire.classify-register` |
+| `discoverAtom()` / `decomposeAtom()` | `src/suggest.ts` | New term discovery | Reads task `grimoire.discover` / `grimoire.decompose` |
+| `classifyText()` | `src/classify.ts` | REST text classification | Reads task `grimoire.classify-text` |
+| Moodboard analysis | `src/routes/moodboard-analysis.ts`, `src/vision-provider.ts` | Per-image IR + aggregate | Reads task `moodboard.aggregate` and vision tasks |
 
 ### Provider Routing
 
@@ -286,30 +334,51 @@ Verify against actual directory before assuming.
 
 ```
 workers/grimoire/
+  migrations/             # 0001-0033+, owned by this worker
   src/
-    index.ts              # Hono router, scanAndEnqueue cron, queue dispatcher
+    index.ts              # Hono router, scheduled() handler, queue dispatcher
+    cron.ts               # scanAndEnqueue: 7 phases (1-6, 8) + Manifest Builder trigger
     types.ts              # All type definitions
     classify.ts           # classifyText() REST endpoint
     atom-classify.ts      # classifyAtom(), classifyRegister()
     suggest.ts            # discoverAtom(), decomposeAtom()
     vectorize.ts          # Embedding generation + semantic search
     reranker.ts           # Cross-encoder reranking
-    atoms.ts              # CRUD for atoms
+    atoms.ts              # CRUD for atoms; createAtomWithHooks/bulkInsertAtomsWithHooks/encounterAtomWithHooks (Phase 8 enqueue points)
     collections.ts        # CRUD for collections
     db.ts                 # Category queries, context lookups
     cache.ts              # Classification cache management
     routing.ts            # StyleFusion routing configuration
     knowledge.ts          # Knowledge sub-app (Hono)
     admin.ts              # Admin sub-app (Hono)
+    manifests.ts          # Manifest Builder: loadFullGraph, buildManifest, buildAllManifests, gzip + R2 write
+    routes/               # Sub-app modules (atoms, classify, dimension, ingest, manifests, moodboard, moodboard-analysis, routing, search, taxonomy)
+    state/                # SQL state files (e.g. moodboards.ts)
+    prompts/              # Prompt templates extracted from handlers
     invoke.ts             # Service binding RPC handler
+    resolve.ts            # POST /api/v1/resolve phrase-to-atom resolver
+    dimension-resolver.ts # Center-of-mass + dimensional pole resolution
     queue-consumers.ts    # handleClassifyBatch, handleVectorizeBatch, handleEnrichBatch, handleDlqBatch
-    workflows.ts          # BulkRetagWorkflow, BulkCorrespondencesWorkflow
-    arrangement-tagger.ts # tagAllAtoms()
+    workflows.ts          # BulkRetagWorkflow, BulkCorrespondencesWorkflow (rowid-cursor pattern)
+    connectivity.ts       # Phase 8 Connectivity Agent: KV queue, watermark sweep, three scorers
+    daily-review.ts       # Daily review markdown generator (writes to R2)
+    quality-gate.ts       # Atom promotion provisional -> confirmed
+    arrangement-tagger.ts # tagAllAtoms(), safeParseJSON, scoring helpers
     content-router.ts     # routeContent()
+    fromImage.ts          # Image extraction pipeline (Gemini Vision)
+    fromImage-review.ts   # Image extraction candidate review/promotion
+    vision-provider.ts    # Vision model dispatch
+    r2-analysis.ts        # R2-stored analysis docs
+    wildcard-bootstrap.ts # Wildcard tag/correspondence bootstrap
+    migration.ts          # buildFilterQuery, migrateAtoms, rejectAtoms (atom migration utility)
     models.ts             # buildModelContext()
+    provider.ts           # Provider abstraction wrapper
+    circuit-breaker.ts    # Circuit-breaker state types
   wrangler.toml
   CLAUDE.md               # This file
 ```
+
+Files are kept under 500 lines per repo convention. Split when approaching the limit.
 
 Shared code imported from `HobBot/src/shared/` via tsconfig paths:
 - providers/gemini.ts (GeminiProvider)
@@ -338,7 +407,7 @@ Shared code imported from `HobBot/src/shared/` via tsconfig paths:
 
 ### D1 Query Performance
 
-Every query that runs on a cron path (scanAndEnqueue, retention, daily review) executes 96 times/day at the 15-minute interval. A single full table scan on the atoms table (178K rows) costs ~600K row reads per tick, compounding to ~57M rows/day. This was the root cause of a $35+ D1 billing spike in April 2026.
+Every query that runs on a cron path (scanAndEnqueue, retention, daily review) executes 96 times/day at the 15-minute interval. At current atom-table size, a single full table scan per tick compounds to tens of millions of row-reads per day. A scan-on-cron-path was the root cause of a $35+ D1 billing spike in April 2026.
 
 **Before deploying any new or modified D1 query on a cron path:**
 1. Run `EXPLAIN QUERY PLAN` on the query against the remote database
@@ -354,6 +423,7 @@ Key indexes that must not be dropped (see grimoire-db for full list):
 - `idx_corr_a_provenance` / `idx_corr_b_provenance`: Phase 6 correspondence discovery (covering composites that replaced the OR scan)
 - `idx_integrity_scans_created`: retention cleanup
 - Partial index on atoms for Phase 3 harmonics enrichment (`WHERE harmonics IS NULL`)
+- `idx_atom_tags_atom_id`, `idx_dimension_memberships_atom_id`: Connectivity Agent + Manifest Builder reads
 
 ### Code Rules
 
@@ -370,15 +440,17 @@ Key indexes that must not be dropped (see grimoire-db for full list):
 ### What NOT To Do
 
 - Do not insert atoms directly to "seed" the Grimoire. Submit knowledge through HobBot's ingest pipeline.
+- Do not bypass `createAtomWithHooks` / `bulkInsertAtomsWithHooks` / `encounterAtomWithHooks` — they're the Phase 8 enqueue points. New atoms inserted by other paths won't get Connectivity-Agent processing.
 - Do not treat atom count as a quality metric
 - Do not write to GRIMOIRE_DB from any other worker (except grimoire-classifier, which shares the D1 binding)
 - Do not reference specific counts in documentation or comments
 - Do not change embedding models or vector dimensions without explicit approval
-- Do not hardcode model version strings, provider URLs, or API keys
-- Do not add Gemini-only call sites. New AI calls need a Workers AI primary with Gemini as fallback.
+- Do not hardcode model version strings, category slugs, arrangement lists, or tag slugs. Query at runtime.
+- Do not add Gemini-only call sites. New AI calls need a Workers AI primary with a different Workers AI model as fallback. Gemini only when Workers AI cannot do the task; document the justification.
 - Do not bypass the circuit breaker by calling providers directly
 - Do not modify queue batch sizes or concurrency without understanding downstream CPU budget impact
 - Do not drop or rename D1 indexes without verifying no cron query depends on them (see D1 Query Performance section)
+- Do not query composite-PK tables (`atom_tags`, `dimension_memberships`) with `WHERE atom_id > ?` cursor pagination — it skips rows. Use `rowid > ?` instead, see `BulkRetagWorkflow` and `manifests.ts` for the pattern.
 
 ## Build and Deploy
 
